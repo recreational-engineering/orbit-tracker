@@ -30,6 +30,7 @@
     trackPast: '#ff6b6b',
     mesh: 'rgba(255, 120, 120, .55)',
     footprint: 'rgba(255, 226, 122, .9)',
+    behind: '#c4c8cc',
     sat: '#ffcc00',
     reticle: 'rgba(30, 30, 30, .55)',
     text: '#e9e3cf',
@@ -489,6 +490,7 @@
 
     if (state.mode === 'orbit') drawMarkMesh();
     drawFootprint();
+    drawBehindEarth();
 
     if (isFlat()) drawFlatShading(cx, cy, r); else drawGlobeShading(cx, cy, r);
     ctx.restore();
@@ -595,15 +597,66 @@
       const a = pts[i - 1], b = pts[i];
       const past = b.t <= 0;
       const fade = 1 - 0.65 * (Math.abs(b.t) / TRACK_SPAN_S);
-      // Behind the Earth: faint dashed line. In view: solid, past thinner than future.
-      const hidden = a.hidden || b.hidden;
-      ctx.globalAlpha = hidden ? 0.45 * fade : fade;
+      // Behind the Earth: not drawn here; drawBehindEarth() prints it grey on the surface.
+      if (a.hidden || b.hidden) continue;
+      ctx.globalAlpha = fade;
       ctx.strokeStyle = past ? C.trackPast : C.trackFuture;
-      ctx.lineWidth = hidden ? s / 400 : past ? s / 300 : s / 200;
-      ctx.setLineDash(hidden ? [s / 100, s / 120] : []);
+      ctx.lineWidth = past ? s / 300 : s / 200;
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
-    ctx.setLineDash([]);
+    ctx.restore();
+  }
+
+  // Whatever is behind the Earth keeps the real orbit's shape (its straight-through
+  // projection), but is drawn as a solid grey line printed on the visible surface:
+  // drawn inside the globe clip before the glass shading, so the globe stays opaque.
+  // Grey track, grey 5-min ticks (ground view) and a grey dot for a hidden object.
+  function drawBehindEarth() {
+    if (isFlat() || state.track.length < 2) return;
+    const s = state.size;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = C.behind;
+
+    let prev = null;
+    for (const p of state.track) {
+      const g = geoOf(p.r, frameGmst(p));
+      const cur = { t: p.t, ...project3d(g.lon, g.lat, g.alt) };
+      if (prev && (prev.hidden || cur.hidden)) {
+        ctx.globalAlpha = 1 - 0.6 * Math.abs(cur.t) / TRACK_SPAN_S;
+        ctx.lineWidth = cur.t <= 0 ? s / 340 : s / 260;
+        ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(cur.x, cur.y); ctx.stroke();
+      }
+      prev = cur;
+    }
+
+    if (state.mode === 'home') {
+      const half = s / 110;
+      for (const m of state.marks) {
+        const a = project3d(m.lon, m.lat, m.alt);
+        if (!a.hidden) continue;
+        const b = project3d(m.dir.lon, m.dir.lat, m.dir.alt);
+        const dx = b.x - a.x, dy = b.y - a.y, n = Math.hypot(dx, dy);
+        if (n < 1e-6) continue;
+        ctx.globalAlpha = 1 - 0.6 * Math.abs(m.t) / TRACK_SPAN_S;
+        ctx.lineWidth = s / 300;
+        ctx.beginPath();
+        ctx.moveTo(a.x + dy / n * half, a.y - dx / n * half);
+        ctx.lineTo(a.x - dy / n * half, a.y + dx / n * half);
+        ctx.stroke();
+      }
+    }
+
+    if (state.now) {
+      const g = geoOf(state.now.r, state.now.gmst), a = project3d(g.lon, g.lat, g.alt);
+      if (a.hidden) {
+        // Hollow ring, same stroke width as the (future) grey track line.
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = C.behind;
+        ctx.lineWidth = s / 260;
+        ctx.beginPath(); ctx.arc(a.x, a.y, s / 55, 0, 2 * Math.PI); ctx.stroke();
+      }
+    }
     ctx.restore();
   }
 
@@ -662,10 +715,10 @@
       const dx = q.x - p.x, dy = q.y - p.y, n = Math.hypot(dx, dy);
       if (n < 1e-6) continue;
       const nx = -dy / n * half, ny = dx / n * half;   // screen-space perpendicular
-      const fade = 1 - 0.65 * Math.abs(m.t) / TRACK_SPAN_S;
-      ctx.globalAlpha = p.hidden ? 0.45 * fade : fade;
+      if (p.hidden) continue;   // drawn grey by drawBehindEarth()
+      ctx.globalAlpha = 1 - 0.65 * Math.abs(m.t) / TRACK_SPAN_S;
       ctx.strokeStyle = m.t > 0 ? C.trackFuture : C.trackPast;
-      ctx.lineWidth = p.hidden ? s / 400 : s / 240;
+      ctx.lineWidth = s / 240;
       ctx.beginPath(); ctx.moveTo(p.x - nx, p.y - ny); ctx.lineTo(p.x + nx, p.y + ny); ctx.stroke();
     }
     ctx.restore();
@@ -676,9 +729,9 @@
     const s = state.size;
     const sat = geoOf(state.now.r, state.now.gmst);
     const p = project3d(sat.lon, sat.lat, sat.alt);
+    if (p.hidden) return;   // behind the Earth: grey dot from drawBehindEarth() instead
     const g = project3d(sat.lon, sat.lat, 0);
     ctx.save();
-    if (p.hidden) ctx.globalAlpha = 0.3;   // obstructed by the Earth
 
     // Drop line to the sub-satellite point.
     if (g.front) {

@@ -69,10 +69,15 @@ display size.
    (`drawFootprint()`).
 5. Shading: radial light from upper-left, limb darkening, elliptical glass glint.
 6. Centre reticle.
-7. Track: future solid red, past thinner light red, fading with |Δt|; segments
-   hidden behind the Earth are drawn faint and dashed.
-   Points are lifted by altitude (radius × (1 + h/6371)); hidden = behind
-   the Earth disk (`project3d()`).
+7. Track: future solid red, past thinner light red, fading with |Δt|. Points are
+   lifted by altitude (radius × (1 + h/6371)); hidden = behind the Earth disk
+   (`project3d()`). Hidden parts are NOT drawn through the globe.
+7a. Behind-the-Earth display (`drawBehindEarth()`, globe views only): hidden
+   parts keep the real orbit's projected shape but are drawn as a solid grey
+   (#c4c8cc) line printed on the visible surface (inside the globe clip, under
+   the glass shading), so the globe stays opaque. A hidden object is a hollow grey
+   ring (radius s/55, stroke = track width s/260) at its projected position (no stage model); in ground view hidden 5-min
+   ticks are grey.
 7b. 5-minute travel-time marks at absolute times (`state.marks`, ground point at
    that moment). Munich view: short screen-space ticks across the track
    (`drawMarkTicks()`). Orbit view: no ticks; instead ±60° great-circle lines
@@ -80,7 +85,7 @@ display size.
    shading, turning with the Earth (`drawMarkMesh()`).
 8. Object: simplified upper stage (nozzle, aft dome, white tank, blue ring,
    payload adapter, gold payload) from lit frustums, nose along the projected
-   3D flight direction; 30 % opacity when obstructed (`drawStage()`).
+   3D flight direction; not drawn when obstructed (`drawStage()`).
 8b. Home marker: blue dot with white rim + "MUNICH" label (`drawHome()`).
 9. HUD (`drawHud()`), instrument-cluster style: Barlow Condensed (OFL,
    `web/vendor/barlow-condensed-*.woff2`), white digits, small superscript
