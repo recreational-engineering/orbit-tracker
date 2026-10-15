@@ -62,7 +62,11 @@ display size.
    payload adapter, gold payload) from lit frustums, nose along the projected
    3D flight direction; 30 % opacity when obstructed (`drawStage()`).
 8b. Home marker: blue dot with white rim + "MUNICH" label (`drawHome()`).
-9. HUD pills: UTC time (top), lat/lon/alt (bottom).
+9. HUD: UTC time pill (top); bottom block with lat/lon/alt,
+   `Distance: N km` (straight-line range from Munich at ground level, updated
+   at 10 Hz, `rangeToHome()`) and `Next Pass: HH:MM` (Munich local time of
+   the next range minimum: 20 s scan up to 4 h, ternary refinement to 1 s,
+   recomputed once a second, `findNextPass()`).
 
 Side-panel controls (time offset, altitude exaggeration, layer toggles,
 night side) are prototyping aids, not part of the device UI.

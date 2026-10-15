@@ -12,7 +12,10 @@
   const TRACK_STEP_S = 30;
   const MARK_STEP_S = 300;     // 5-minute travel-time marks
   const MESH_HALF_DEG = 60;    // half length of the cross lines printed on the globe (orbit view)
-  const HOME = { name: 'Munich', lon: 11.575, lat: 48.137 };
+  const HOME = { name: 'Munich', lon: 11.575, lat: 48.137, tz: 'Europe/Berlin' };
+  const PASS_SEARCH_STEP_S = 20;
+  const PASS_SEARCH_SPAN_S = 4 * 3600;
+  const homeTime = new Intl.DateTimeFormat('de-DE', { timeZone: HOME.tz, hour: '2-digit', minute: '2-digit' });
   const DEG = 180 / Math.PI;
 
   // Aviation-chart palette: saturated blue sea, terrain-tinted land.
@@ -55,6 +58,7 @@
     ahead: null,              // same, a few seconds later: flight direction
     sat: null,                // geodetic {lon, lat, alt, vel} for the readouts
     track: [],                // [{t, r, gmst}] ±1 h, ECI
+    nextPass: null,           // Date of the next range minimum to HOME
     marks: [],                // 5-min marks at absolute times: {t, lon, lat, alt, dir: {lon, lat, alt}}
     land: null,
     borders: null,
@@ -294,6 +298,7 @@
       if (a && b) marks.push({ t: (ms - t0) / 1000, ...geoOf(a.r, a.gmst), dir: geoOf(b.r, b.gmst) });
     }
     state.marks = marks;
+    state.nextPass = findNextPass(now);
     const cur = propagateEci(now);
     if (cur) {
       const g = satellite.eciToGeodetic({ x: cur.r[0], y: cur.r[1], z: cur.r[2] }, cur.gmst);
@@ -304,6 +309,35 @@
     }
     updateReadout();
     state.dirty = true;
+  }
+
+  // Straight-line distance (km) from HOME at ground level to the object.
+  let homeEcf = null;
+  function rangeToHome(eci) {
+    if (!homeEcf) homeEcf = satellite.geodeticToEcf({ longitude: HOME.lon / DEG, latitude: HOME.lat / DEG, height: 0 });
+    const e = satellite.eciToEcf({ x: eci.r[0], y: eci.r[1], z: eci.r[2] }, eci.gmst);
+    return Math.hypot(e.x - homeEcf.x, e.y - homeEcf.y, e.z - homeEcf.z);
+  }
+
+  // Next pass = first local minimum of the range to HOME after `from`:
+  // coarse scan, then ternary-search refinement to ~1 s.
+  function findNextPass(from) {
+    const t0 = from.getTime();
+    const rangeAt = (ms) => { const p = propagateEci(new Date(ms)); return p ? rangeToHome(p) : Infinity; };
+    let prev = rangeAt(t0), cur = rangeAt(t0 + PASS_SEARCH_STEP_S * 1000);
+    for (let dt = 2 * PASS_SEARCH_STEP_S; dt <= PASS_SEARCH_SPAN_S; dt += PASS_SEARCH_STEP_S) {
+      const next = rangeAt(t0 + dt * 1000);
+      if (cur <= prev && cur < next) {
+        let lo = t0 + (dt - 2 * PASS_SEARCH_STEP_S) * 1000, hi = t0 + dt * 1000;
+        while (hi - lo > 1000) {
+          const m1 = lo + (hi - lo) / 3, m2 = hi - (hi - lo) / 3;
+          if (rangeAt(m1) < rangeAt(m2)) hi = m2; else lo = m1;
+        }
+        return new Date((lo + hi) / 2);
+      }
+      prev = cur; cur = next;
+    }
+    return null;
   }
 
   // View orientation the current mode wants.
@@ -695,10 +729,24 @@
 
     const t = simTime();
     pill(t.toISOString().slice(11, 19) + ' UTC', s * 0.1);
-    if (state.sat) {
+    if (state.sat && state.now) {
       const { lat, lon, alt } = state.sat;
       const ll = `${Math.abs(lat).toFixed(1)}°${lat >= 0 ? 'N' : 'S'} ${Math.abs(lon).toFixed(1)}°${lon >= 0 ? 'E' : 'W'}`;
-      pill(`${ll}  ${alt.toFixed(0)} km`, s * 0.9);
+      const lines = [
+        `${ll}  ${alt.toFixed(0)} km`,
+        `Distance: ${Math.round(rangeToHome(state.now))} km`,
+        `Next Pass: ${state.nextPass ? homeTime.format(state.nextPass) : '--:--'}`,
+      ];
+      // Stacked block at the bottom of the round screen; last line where the chord is still wide.
+      const lh = fs * 1.3, yLast = s * 0.905, pad = fs * 0.7;
+      const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + pad * 2;
+      const h = lh * lines.length + pad * 0.6;
+      ctx.fillStyle = 'rgba(20,22,22,.72)';
+      ctx.beginPath();
+      ctx.roundRect(s / 2 - w / 2, yLast + lh / 2 + pad * 0.3 - h, w, h, fs * 0.8);
+      ctx.fill();
+      ctx.fillStyle = C.text;
+      lines.forEach((l, i) => ctx.fillText(l, s / 2, yLast - (lines.length - 1 - i) * lh));
     }
     ctx.restore();
   }
@@ -716,6 +764,7 @@
       ['Speed', sat.vel.toFixed(2) + ' km/s'],
       ['Inclination', omm.INCLINATION.toFixed(2) + '°'],
       ['Period', period.toFixed(1) + ' min'],
+      ['Next pass (' + HOME.name + ')', state.nextPass ? homeTime.format(state.nextPass) : '–'],
     ];
     ui.readout.innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
   }
