@@ -506,13 +506,9 @@
     ctx.strokeStyle = '#ffffff';
     ctx.lineWidth = Math.max(1.2, s / 360);
     ctx.beginPath(); ctx.arc(p.x, p.y, rr, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
-    ctx.font = `600 ${Math.round(s / 48)}px "Courier New", monospace`;
     ctx.textBaseline = 'middle';
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = 'rgba(0,0,0,.6)';
-    ctx.strokeText(HOME.name.toUpperCase(), p.x + rr * 2, p.y);
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText(HOME.name.toUpperCase(), p.x + rr * 2, p.y);
+    ctx.textAlign = 'left';
+    hudText(HOME.name.toUpperCase(), p.x + rr * 2, p.y, Math.round(s / 36), 500);
     ctx.restore();
   }
 
@@ -707,46 +703,166 @@
     ctx.restore();
   }
 
-  // Minimal on-screen readout, laid out for a round screen (centered, near top/bottom).
-  function drawHud() {
-    const s = state.size;
-    const fs = Math.round(s / 34);
-    ctx.save();
-    ctx.font = `600 ${fs}px "Courier New", monospace`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
+  // ---------- HUD ----------
+  // Instrument-cluster style (cf. marine chart plotters): white condensed DIN-like digits,
+  // small superscript units, simple line icons, no boxes except the top time tag.
+  // Readouts sit around the globe's rim so the globe itself stays clear.
+  const HUD_FONT = '"Barlow Condensed", "DIN Condensed", "Arial Narrow", sans-serif';
 
-    const pill = (text, y) => {
-      const w = ctx.measureText(text).width + fs * 1.4;
-      const h = fs * 1.6;
-      ctx.fillStyle = 'rgba(20,22,22,.72)';
+  async function loadFonts() {
+    try {
+      await Promise.all([500, 600].map(async (w) => {
+        const f = new FontFace('Barlow Condensed', `url(vendor/barlow-condensed-${w}.woff2)`, { weight: String(w) });
+        document.fonts.add(await f.load());
+      }));
+    } catch (e) { /* falls back to system condensed fonts */ }
+    state.dirty = true;
+  }
+
+  // Text, optionally with a thin dark outline so it stays legible over bright terrain.
+  function hudText(text, x, y, size, weight = 600, outline = true) {
+    ctx.font = `${weight} ${size}px ${HUD_FONT}`;
+    if (outline) {
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = Math.max(2, size * 0.16);
+      ctx.strokeStyle = 'rgba(0,0,0,.7)';
+      ctx.strokeText(text, x, y);
+    }
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(text, x, y);
+    return ctx.measureText(text).width;
+  }
+
+  // Icons: plain paths so they port to any embedded graphics lib.
+  const ICONS = {
+    // Map pin = distance from home.
+    pin(x, y, h) {
+      const r = h * 0.3, cy = y - h * 0.12;
       ctx.beginPath();
-      ctx.roundRect(s / 2 - w / 2, y - h / 2, w, h, h / 2);
-      ctx.fill();
-      ctx.fillStyle = C.text;
-      ctx.fillText(text, s / 2, y);
-    };
+      ctx.arc(x, cy, r, Math.PI * 0.8, Math.PI * 2.2);
+      ctx.lineTo(x, y + h * 0.48);
+      ctx.closePath();
+      ctx.fill(); ctx.stroke();
+      ctx.save(); ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(x, cy, r * 0.4, 0, 2 * Math.PI); ctx.fill(); ctx.restore();
+    },
+    // Clock = time of next pass.
+    clock(x, y, h) {
+      const r = h * 0.42;
+      ctx.save();
+      ctx.lineWidth = Math.max(1.5, h * 0.12);
+      ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.lineWidth += 2;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.stroke();
+      ctx.lineWidth -= 2; ctx.strokeStyle = '#fff';
+      ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI);
+      ctx.moveTo(x, y); ctx.lineTo(x, y - r * 0.65);
+      ctx.moveTo(x, y); ctx.lineTo(x + r * 0.5, y + r * 0.1);
+      ctx.stroke();
+      ctx.restore();
+    },
+    // Up-triangle over a ground line = altitude.
+    alt(x, y, h) {
+      const w = h * 0.42;
+      ctx.beginPath();
+      ctx.moveTo(x, y - h * 0.42); ctx.lineTo(x + w, y + h * 0.22); ctx.lineTo(x - w, y + h * 0.22);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.fillRect(x - w, y + h * 0.34, 2 * w, Math.max(1.5, h * 0.1));
+    },
+  };
 
-    const t = simTime();
-    pill(t.toISOString().slice(11, 19) + ' UTC', s * 0.1);
+  // One readout: [icon] VALUE ᵘⁿⁱᵗ starting at x. Returns its width; draw=false only measures.
+  function readout(x, y, { icon, value, unit }, fs, draw = true) {
+    const us = Math.round(fs * 0.5), ih = fs * 0.75, gap = fs * 0.22;
+    ctx.font = `600 ${fs}px ${HUD_FONT}`;
+    const vw = ctx.measureText(value).width;
+    ctx.font = `500 ${us}px ${HUD_FONT}`;
+    const uw = unit ? ctx.measureText(unit).width + fs * 0.06 : 0;
+    const iw = icon ? ih + gap : 0;
+    if (!draw) return iw + vw + uw;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    if (icon) {
+      ctx.fillStyle = '#fff';
+      ctx.strokeStyle = 'rgba(0,0,0,0)';
+      ctx.lineWidth = 1;
+      ICONS[icon](x + ih / 2, y, ih);
+    }
+    hudText(value, x + iw, y, fs, 600, false);
+    if (unit) hudText(unit, x + iw + vw + fs * 0.06, y - fs * 0.22, us, 500, false);
+    return iw + vw + uw;
+  }
+
+  // A centred row of readouts separated by thin vertical rules. Returns the row width.
+  function readoutRow(items, y, fs, draw = true) {
+    const sep = fs * 0.9;
+    const widths = items.map((it) => readout(0, 0, it, fs, false));
+    const total = widths.reduce((a, b) => a + b, 0) + sep * (items.length - 1);
+    if (!draw) return total;
+    let x = state.size / 2 - total / 2;
+    items.forEach((it, i) => {
+      readout(x, y, it, fs);
+      x += widths[i];
+      if (i < items.length - 1) {
+        ctx.fillStyle = 'rgba(255,255,255,.28)';
+        ctx.fillRect(Math.round(x + sep / 2), y - fs * 0.38, 1, fs * 0.76);
+        x += sep;
+      }
+    });
+    return total;
+  }
+
+  // Tab-shaped dark panel that runs into the round screen edge: a flat edge just as wide as
+  // its content, then steep angled flanks out to the screen circle, so it covers little globe.
+  const BAND_ANGLE = 58 / DEG;   // flank angle from horizontal
+  function edgeBand(yCut, halfWidth, top) {
+    const s = state.size, c = s / 2, dir = top ? -1 : 1;
+    const L = s, dx = Math.cos(BAND_ANGLE) * L, dy = Math.sin(BAND_ANGLE) * L * dir;
+    const rad = s * 0.012;   // softened corners
+    const edge = () => {
+      ctx.moveTo(c - halfWidth - dx, yCut + dy);
+      ctx.arcTo(c - halfWidth, yCut, c + halfWidth, yCut, rad);
+      ctx.arcTo(c + halfWidth, yCut, c + halfWidth + dx, yCut + dy, rad);
+      ctx.lineTo(c + halfWidth + dx, yCut + dy);
+    };
+    ctx.save();
+    ctx.beginPath(); ctx.arc(c, c, c, 0, 2 * Math.PI); ctx.clip();
+    const g = ctx.createLinearGradient(0, yCut, 0, top ? 0 : s);
+    g.addColorStop(0, 'rgba(12,13,14,.78)');
+    g.addColorStop(1, 'rgba(12,13,14,.92)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); edge(); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.18)';   // hairline along the edge
+    ctx.lineWidth = 1;
+    ctx.beginPath(); edge(); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawHud() {
+    const s = state.size, pad = s * 0.03;
+    ctx.save();
+
+    // Top tab: UTC time.
+    const timeRow = [{ value: simTime().toISOString().slice(11, 19), unit: 'UTC' }];
+    const tfs = Math.round(s * 0.034);
+    edgeBand(s * 0.068, readoutRow(timeRow, 0, tfs, false) / 2 + pad, true);
+    readoutRow(timeRow, s * 0.038, tfs);
+
+    // Bottom tab: primary row (distance to Munich, next pass), secondary row (position, altitude).
     if (state.sat && state.now) {
       const { lat, lon, alt } = state.sat;
-      const ll = `${Math.abs(lat).toFixed(1)}°${lat >= 0 ? 'N' : 'S'} ${Math.abs(lon).toFixed(1)}°${lon >= 0 ? 'E' : 'W'}`;
-      const lines = [
-        `${ll}  ${alt.toFixed(0)} km`,
-        `Distance: ${Math.round(rangeToHome(state.now))} km`,
-        `Next Pass: ${state.nextPass ? homeTime.format(state.nextPass) : '--:--'}`,
+      const primary = [
+        { icon: 'pin', value: String(Math.round(rangeToHome(state.now))), unit: 'km' },
+        { icon: 'clock', value: state.nextPass ? homeTime.format(state.nextPass) : '--:--' },
       ];
-      // Stacked block at the bottom of the round screen; last line where the chord is still wide.
-      const lh = fs * 1.3, yLast = s * 0.905, pad = fs * 0.7;
-      const w = Math.max(...lines.map((l) => ctx.measureText(l).width)) + pad * 2;
-      const h = lh * lines.length + pad * 0.6;
-      ctx.fillStyle = 'rgba(20,22,22,.72)';
-      ctx.beginPath();
-      ctx.roundRect(s / 2 - w / 2, yLast + lh / 2 + pad * 0.3 - h, w, h, fs * 0.8);
-      ctx.fill();
-      ctx.fillStyle = C.text;
-      lines.forEach((l, i) => ctx.fillText(l, s / 2, yLast - (lines.length - 1 - i) * lh));
+      const secondary = [
+        { value: Math.abs(lat).toFixed(1) + '°', unit: lat >= 0 ? 'N' : 'S' },
+        { value: Math.abs(lon).toFixed(1) + '°', unit: lon >= 0 ? 'E' : 'W' },
+        { icon: 'alt', value: alt.toFixed(0), unit: 'km' },
+      ];
+      const pfs = Math.round(s * 0.038), sfs = Math.round(s * 0.028);
+      // The flat edge only has to fit the first row; the flanks widen toward the second.
+      edgeBand(s * 0.855, readoutRow(primary, 0, pfs, false) / 2 + pad, false);
+      readoutRow(primary, s * 0.888, pfs);
+      readoutRow(secondary, s * 0.935, sfs);
     }
     ctx.restore();
   }
@@ -861,6 +977,7 @@
   setMode(state.mode);
   loadMap();
   loadTexture();
+  loadFonts();
   loadNightLights();
   loadSatellite(Number(ui.norad.value));
   requestAnimationFrame(frame);

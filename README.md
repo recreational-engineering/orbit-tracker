@@ -62,11 +62,18 @@ display size.
    payload adapter, gold payload) from lit frustums, nose along the projected
    3D flight direction; 30 % opacity when obstructed (`drawStage()`).
 8b. Home marker: blue dot with white rim + "MUNICH" label (`drawHome()`).
-9. HUD: UTC time pill (top); bottom block with lat/lon/alt,
-   `Distance: N km` (straight-line range from Munich at ground level, updated
-   at 10 Hz, `rangeToHome()`) and `Next Pass: HH:MM` (Munich local time of
-   the next range minimum: 20 s scan up to 4 h, ternary refinement to 1 s,
-   recomputed once a second, `findNextPass()`).
+9. HUD (`drawHud()`), instrument-cluster style: Barlow Condensed (OFL,
+   `web/vendor/barlow-condensed-*.woff2`), white digits, small superscript
+   units, line icons. Two dark tab-shaped panels that run into the round screen
+   edge (`edgeBand()`): a flat edge only as wide as the content, then 58° flanks
+   out to the screen circle, softened corners, hairline along the edge:
+   - top tab (edge at 0.068·s, text 0.034·s): UTC time;
+   - bottom tab (edge at 0.855·s): primary row (0.038·s) = pin icon + distance
+     from Munich at ground level (10 Hz, `rangeToHome()`) | clock icon + Munich
+     local time of the next range minimum (20 s scan up to 4 h, ternary
+     refinement to 1 s, `findNextPass()`); secondary row (0.028·s) =
+     latitude | longitude | altitude icon + altitude.
+   Items in a row are separated by thin vertical rules (`readoutRow()`).
 
 Side-panel controls (time offset, altitude exaggeration, layer toggles,
 night side) are prototyping aids, not part of the device UI.
