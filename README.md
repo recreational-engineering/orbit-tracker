@@ -50,9 +50,14 @@ display size.
 5. Shading: radial light from upper-left, limb darkening, elliptical glass glint.
 6. Centre reticle.
 7. Track: future solid red, past thinner light red, fading with |Δt|; segments
-   hidden behind the Earth are drawn faint and dashed. Ticks every 10 min.
+   hidden behind the Earth are drawn faint and dashed.
    Points are lifted by altitude (radius × (1 + h/6371)); hidden = behind
    the Earth disk (`project3d()`).
+7b. 5-minute travel-time marks at absolute times (`state.marks`, ground point at
+   that moment). Munich view: short screen-space ticks across the track
+   (`drawMarkTicks()`). Orbit view: no ticks; instead ±60° great-circle lines
+   perpendicular to the ground track, printed on the globe under the glass
+   shading, turning with the Earth (`drawMarkMesh()`).
 8. Object: simplified upper stage (nozzle, aft dome, white tank, blue ring,
    payload adapter, gold payload) from lit frustums, nose along the projected
    3D flight direction; 30 % opacity when obstructed (`drawStage()`).

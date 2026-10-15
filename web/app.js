@@ -10,6 +10,8 @@
   const EARTH_R_KM = 6371;
   const TRACK_SPAN_S = 3600;  // ±1 h
   const TRACK_STEP_S = 30;
+  const MARK_STEP_S = 300;     // 5-minute travel-time marks
+  const MESH_HALF_DEG = 60;    // half length of the cross lines printed on the globe (orbit view)
   const HOME = { name: 'Munich', lon: 11.575, lat: 48.137 };
   const DEG = 180 / Math.PI;
 
@@ -23,6 +25,7 @@
     graticule: 'rgba(255, 255, 255, .16)',
     trackFuture: '#c8102e',
     trackPast: '#ff6b6b',
+    mesh: 'rgba(255, 120, 120, .55)',
     sat: '#ffcc00',
     reticle: 'rgba(30, 30, 30, .55)',
     text: '#e9e3cf',
@@ -52,6 +55,7 @@
     ahead: null,              // same, a few seconds later: flight direction
     sat: null,                // geodetic {lon, lat, alt, vel} for the readouts
     track: [],                // [{t, r, gmst}] ±1 h, ECI
+    marks: [],                // 5-min marks at absolute times: {t, lon, lat, alt, dir: {lon, lat, alt}}
     land: null,
     borders: null,
     tex: null,                // terrain texture {w, h, px: Uint8ClampedArray}, alpha 0 = water
@@ -280,6 +284,16 @@
       if (p) track.push({ t: dt, ...p });
     }
     state.track = track;
+
+    // 5-minute marks pinned to absolute times (so they don't jump as "now" advances),
+    // in the Earth-fixed frame: the ground point the object passes at that moment.
+    const marks = [];
+    const step = MARK_STEP_S * 1000, t0 = now.getTime();
+    for (let ms = Math.ceil((t0 - TRACK_SPAN_S * 1000) / step) * step; ms <= t0 + TRACK_SPAN_S * 1000; ms += step) {
+      const a = propagateEci(new Date(ms)), b = propagateEci(new Date(ms + 10000));
+      if (a && b) marks.push({ t: (ms - t0) / 1000, ...geoOf(a.r, a.gmst), dir: geoOf(b.r, b.gmst) });
+    }
+    state.marks = marks;
     const cur = propagateEci(now);
     if (cur) {
       const g = satellite.eciToGeodetic({ x: cur.r[0], y: cur.r[1], z: cur.r[2] }, cur.gmst);
@@ -405,12 +419,15 @@
       ctx.globalCompositeOperation = 'source-over';
     }
 
+    if (state.mode === 'orbit') drawMarkMesh();
+
     drawGlobeShading(cx, cy, r);
     ctx.restore();
 
     if (ui.reticle.checked) drawReticle(cx, cy, r);
     drawHome();
     drawTrack();
+    if (state.mode === 'home') drawMarkTicks();
     drawSatellite();
     drawHud();
   }
@@ -502,15 +519,55 @@
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
     ctx.setLineDash([]);
+    ctx.restore();
+  }
 
-    // Ticks every 10 minutes along the track.
-    for (const p of pts) {
-      if (p.hidden || p.t === 0 || p.t % 600 !== 0) continue;
-      ctx.globalAlpha = 1 - 0.6 * (Math.abs(p.t) / TRACK_SPAN_S);
-      ctx.fillStyle = p.t > 0 ? C.trackFuture : '#ffffff';
-      ctx.strokeStyle = C.trackFuture;
-      ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.arc(p.x, p.y, s / 200, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+  // Great-circle helpers (degrees).
+  function azimuth(lon1, lat1, lon2, lat2) {
+    const p1 = lat1 / DEG, p2 = lat2 / DEG, dl = (lon2 - lon1) / DEG;
+    return Math.atan2(Math.sin(dl) * Math.cos(p2),
+      Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl)) * DEG;
+  }
+  function destination(lon, lat, azDeg, distDeg) {
+    const p1 = lat / DEG, th = azDeg / DEG, d = distDeg / DEG;
+    const p2 = Math.asin(Math.sin(p1) * Math.cos(d) + Math.cos(p1) * Math.sin(d) * Math.cos(th));
+    const l2 = lon / DEG + Math.atan2(Math.sin(th) * Math.sin(d) * Math.cos(p1),
+      Math.cos(d) - Math.sin(p1) * Math.sin(p2));
+    return [l2 * DEG, p2 * DEG];
+  }
+
+  // Orbit view: lines across the ground track at each 5-min mark, printed on the globe
+  // (great-circle arcs, so they curve with the surface and turn with the Earth).
+  function drawMarkMesh() {
+    const s = state.size;
+    ctx.save();
+    ctx.strokeStyle = C.mesh;
+    ctx.lineWidth = Math.max(0.7, s / 600);
+    for (const m of state.marks) {
+      const az = azimuth(m.lon, m.lat, m.dir.lon, m.dir.lat) + 90;
+      const coords = [];
+      for (let d = -MESH_HALF_DEG; d <= MESH_HALF_DEG; d += 5) coords.push(destination(m.lon, m.lat, az, d));
+      ctx.globalAlpha = 1 - 0.5 * Math.abs(m.t) / TRACK_SPAN_S;
+      ctx.beginPath(); path({ type: 'LineString', coordinates: coords }); ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Munich view: short ticks across the drawn track at each 5-min mark.
+  function drawMarkTicks() {
+    const s = state.size, half = s / 90;
+    ctx.save();
+    ctx.lineCap = 'round';
+    for (const m of state.marks) {
+      const p = project3d(m.lon, m.lat, m.alt), q = project3d(m.dir.lon, m.dir.lat, m.dir.alt);
+      const dx = q.x - p.x, dy = q.y - p.y, n = Math.hypot(dx, dy);
+      if (n < 1e-6) continue;
+      const nx = -dy / n * half, ny = dx / n * half;   // screen-space perpendicular
+      const fade = 1 - 0.65 * Math.abs(m.t) / TRACK_SPAN_S;
+      ctx.globalAlpha = p.hidden ? 0.45 * fade : fade;
+      ctx.strokeStyle = m.t > 0 ? C.trackFuture : C.trackPast;
+      ctx.lineWidth = p.hidden ? s / 400 : s / 240;
+      ctx.beginPath(); ctx.moveTo(p.x - nx, p.y - ny); ctx.lineTo(p.x + nx, p.y + ny); ctx.stroke();
     }
     ctx.restore();
   }
