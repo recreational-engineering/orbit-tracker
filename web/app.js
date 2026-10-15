@@ -55,6 +55,7 @@
     land: null,
     borders: null,
     tex: null,                // terrain texture {w, h, px: Uint8ClampedArray}, alpha 0 = water
+    lights: null,             // city lights {w, h, px: Uint8Array}, one byte per texel
     dirty: true,
   };
 
@@ -111,19 +112,54 @@
     state.dirty = true;
   }
 
-  // Per-pixel inverse orthographic projection of the terrain texture onto the globe.
-  let globeBuf = null;
-  function renderTexturedGlobe() {
+  // NASA "Earth at Night" (Suomi NPP VIIRS, 2012), equirectangular. The image has a dim
+  // blue land/sea background; the warm city lights stand out in the red channel.
+  async function loadNightLights() {
+    const img = new Image();
+    img.src = 'vendor/night-2048.jpg';
+    await img.decode();
+    const c = document.createElement('canvas');
+    c.width = img.width; c.height = img.height;
+    const g = c.getContext('2d');
+    g.drawImage(img, 0, 0);
+    const src = g.getImageData(0, 0, c.width, c.height).data;
+    const px = new Uint8Array(c.width * c.height);
+    for (let i = 0; i < px.length; i++) {
+      const v = Math.max(0, (src[i * 4] - 45) / 170);
+      px[i] = 255 * Math.min(1, Math.pow(v, 1.1));
+    }
+    state.lights = { w: c.width, h: c.height, px };
+    state.dirty = true;
+  }
+
+  const smoothstep = (e0, e1, x) => {
+    const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
+    return t * t * (3 - 2 * t);
+  };
+
+  // Per-pixel inverse orthographic projection onto the globe. One pass fills three buffers:
+  // terrain colour, night darkening (alpha) and city lights (added on top).
+  const bufs = {};
+  function buffer(name, s) {
+    let b = bufs[name];
+    if (!b || b.width !== s) {
+      b = bufs[name] = document.createElement('canvas');
+      b.width = b.height = s;
+    }
+    return b;
+  }
+
+  function renderGlobePixels(withNight) {
     const s = state.size, r = projection.scale();
     const [cx, cy] = projection.translate();
-    if (!globeBuf || globeBuf.width !== s) {
-      globeBuf = document.createElement('canvas');
-      globeBuf.width = globeBuf.height = s;
-    }
-    const g = globeBuf.getContext('2d');
-    const out = g.createImageData(s, s);
-    const o = out.data;
-    const { w, h, px } = state.tex;
+    const terrain = buffer('terrain', s), shade = buffer('shade', s), glow = buffer('glow', s);
+    const out = terrain.getContext('2d').createImageData(s, s), o = out.data;
+    const shOut = shade.getContext('2d').createImageData(s, s), so = shOut.data;
+    const glOut = glow.getContext('2d').createImageData(s, s), go = glOut.data;
+    const tex = state.tex, lights = withNight ? state.lights : null;
+    // Sun direction in Earth-fixed coordinates.
+    const [slon, slat] = subsolarPoint(simTime()).map((d) => d / DEG);
+    const sx = Math.cos(slat) * Math.cos(slon), sy = Math.cos(slat) * Math.sin(slon), sz = Math.sin(slat);
     const lam = state.rotate[0] / DEG, phi = state.rotate[1] / DEG, gam = (state.rotate[2] || 0) / DEG;
     const cp = Math.cos(phi), sp = Math.sin(phi), cg = Math.cos(gam), sg2 = Math.sin(gam);
     const [sr, sg, sb] = C.sea;
@@ -143,17 +179,33 @@
         const zr = Y * cp - Z * sp;
         const lon = Math.atan2(X, xr) - lam;
         const lat = Math.asin(Math.max(-1, Math.min(1, zr)));
-        let u = Math.floor(((lon / (2 * Math.PI) + 0.5) % 1 + 1) % 1 * w);
-        let v = Math.floor((0.5 - lat / Math.PI) * h);
-        if (v >= h) v = h - 1;
-        const ti = (v * w + u) * 4, oi = (py * s + pxl) * 4;
-        if (px[ti + 3] === 0) { o[oi] = sr; o[oi + 1] = sg; o[oi + 2] = sb; }
-        else { o[oi] = px[ti]; o[oi + 1] = px[ti + 1]; o[oi + 2] = px[ti + 2]; }
-        o[oi + 3] = 255;
+        const fu = ((lon / (2 * Math.PI) + 0.5) % 1 + 1) % 1, fv = Math.min(0.9999, 0.5 - lat / Math.PI);
+        const oi = (py * s + pxl) * 4;
+        if (tex) {
+          const ti = (Math.floor(fv * tex.h) * tex.w + Math.floor(fu * tex.w)) * 4, px = tex.px;
+          if (px[ti + 3] === 0) { o[oi] = sr; o[oi + 1] = sg; o[oi + 2] = sb; }
+          else { o[oi] = px[ti]; o[oi + 1] = px[ti + 1]; o[oi + 2] = px[ti + 2]; }
+          o[oi + 3] = 255;
+        }
+        if (withNight) {
+          // Sun elevation → night factor, with a soft twilight band (~+6° … −7°).
+          const cl = Math.cos(lat);
+          const sunDot = cl * Math.cos(lon) * sx + cl * Math.sin(lon) * sy + Math.sin(lat) * sz;
+          const n = smoothstep(0.1, -0.12, sunDot);
+          if (n > 0) {
+            so[oi] = 4; so[oi + 1] = 8; so[oi + 2] = 28; so[oi + 3] = 200 * n;
+            if (lights) {
+              const L = lights.px[Math.floor(fv * lights.h) * lights.w + Math.floor(fu * lights.w)] * n;
+              go[oi] = L; go[oi + 1] = L * 0.8; go[oi + 2] = L * 0.45; go[oi + 3] = 255;
+            }
+          }
+        }
       }
     }
-    g.putImageData(out, 0, 0);
-    return globeBuf;
+    terrain.getContext('2d').putImageData(out, 0, 0);
+    shade.getContext('2d').putImageData(shOut, 0, 0);
+    glow.getContext('2d').putImageData(glOut, 0, 0);
+    return { terrain, shade, glow };
   }
 
   async function loadSatellite(catnr) {
@@ -316,11 +368,13 @@
     ctx.save();
     ctx.beginPath(); path(sphere); ctx.clip();
     ctx.fillStyle = `rgb(${C.sea})`; ctx.fill();
+    const night = ui.night.checked;
+    const px = state.tex || night ? renderGlobePixels(night) : null;
     if (state.land) {
       // Terrain only inside the vector coastline keeps the sea a clean, flat blue.
       ctx.save();
       ctx.beginPath(); path(state.land); ctx.clip();
-      if (state.tex) ctx.drawImage(renderTexturedGlobe(), 0, 0);
+      if (state.tex) ctx.drawImage(px.terrain, 0, 0);
       else { ctx.fillStyle = C.land; ctx.fill(); }
       ctx.restore();
     }
@@ -343,17 +397,19 @@
       ctx.strokeStyle = C.graticule; ctx.lineWidth = 0.6; ctx.stroke();
     }
 
-    if (ui.night.checked) {
-      const [slon, slat] = subsolarPoint(simTime());
-      const night = d3.geoCircle().center([slon + 180, -slat]).radius(90)();
-      ctx.beginPath(); path(night);
-      ctx.fillStyle = 'rgba(10, 20, 45, .38)'; ctx.fill();
+    if (night) {
+      // Darken the night side, then add the city lights on top.
+      ctx.drawImage(px.shade, 0, 0);
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.drawImage(px.glow, 0, 0);
+      ctx.globalCompositeOperation = 'source-over';
     }
 
     drawGlobeShading(cx, cy, r);
     ctx.restore();
 
     if (ui.reticle.checked) drawReticle(cx, cy, r);
+    drawHome();
     drawTrack();
     drawSatellite();
     drawHud();
@@ -386,6 +442,26 @@
     ctx.scale(1, 0.55);
     ctx.fillStyle = glint;
     ctx.beginPath(); ctx.arc(0, 0, r * 0.32, 0, 2 * Math.PI); ctx.fill();
+    ctx.restore();
+  }
+
+  // Home location marker: blue dot with white rim, like an ownship symbol on a chart.
+  function drawHome() {
+    const p = project3d(HOME.lon, HOME.lat, 0);
+    if (!p.front) return;
+    const s = state.size, rr = s / 150;
+    ctx.save();
+    ctx.fillStyle = '#1e7bff';
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = Math.max(1.2, s / 360);
+    ctx.beginPath(); ctx.arc(p.x, p.y, rr, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+    ctx.font = `600 ${Math.round(s / 48)}px "Courier New", monospace`;
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0,0,0,.6)';
+    ctx.strokeText(HOME.name.toUpperCase(), p.x + rr * 2, p.y);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(HOME.name.toUpperCase(), p.x + rr * 2, p.y);
     ctx.restore();
   }
 
@@ -679,6 +755,7 @@
   setMode(state.mode);
   loadMap();
   loadTexture();
+  loadNightLights();
   loadSatellite(Number(ui.norad.value));
   requestAnimationFrame(frame);
 })();

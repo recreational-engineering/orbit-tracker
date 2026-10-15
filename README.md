@@ -43,6 +43,10 @@ display size.
    colours boosted at load (saturation ×2.4, gamma 1.35), clipped to the
    vector coastline (`land-50m.json`). See `renderTexturedGlobe()`.
 4. Coastlines, dashed country borders, faint white 10° graticule.
+4b. Night side (same per-pixel pass, `renderGlobePixels()`): sun elevation from
+   the approximate subsolar point → night factor with a soft twilight band;
+   darken with RGBA(4, 8, 28, 200·n), then add warm city lights (additive) from
+   `web/vendor/night-2048.jpg` (NASA Earth at Night 2012, red channel).
 5. Shading: radial light from upper-left, limb darkening, elliptical glass glint.
 6. Centre reticle.
 7. Track: future solid red, past thinner light red, fading with |Δt|; segments
@@ -52,6 +56,7 @@ display size.
 8. Object: simplified upper stage (nozzle, aft dome, white tank, blue ring,
    payload adapter, gold payload) from lit frustums, nose along the projected
    3D flight direction; 30 % opacity when obstructed (`drawStage()`).
+8b. Home marker: blue dot with white rim + "MUNICH" label (`drawHome()`).
 9. HUD pills: UTC time (top), lat/lon/alt (bottom).
 
 Side-panel controls (time offset, altitude exaggeration, layer toggles,
