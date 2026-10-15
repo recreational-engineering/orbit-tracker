@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Orbit Tracker Prototype</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="layout">
+    <section class="device-wrap">
+      <!-- Emulated round 4" display. The canvas is the exact pixel buffer the ESP32 would render. -->
+      <div class="bezel">
+        <div class="bezel-inner">
+          <canvas id="display" width="480" height="480"></canvas>
+        </div>
+      </div>
+      <div class="plate">ОРБИТА · ORBIT TRACKER</div>
+    </section>
+
+    <aside class="panel">
+      <h1>Orbit tracker <span>prototype</span></h1>
+
+      <div class="group">
+        <label>NORAD ID
+          <span class="row">
+            <input id="norad" type="number" value="100614" min="1">
+            <button id="load">Load</button>
+          </span>
+        </label>
+        <div id="status" class="status">Loading…</div>
+      </div>
+
+      <div class="group">
+        <span class="label">View mode <kbd>M</kbd></span>
+        <div class="segmented">
+          <button data-mode="orbit">Orbit view</button>
+          <button data-mode="home">Munich view</button>
+        </div>
+      </div>
+
+      <dl class="readout" id="readout"></dl>
+
+      <div class="group">
+        <label>Time offset <output id="timeOut">now</output>
+          <input id="time" type="range" min="-720" max="720" step="1" value="0">
+        </label>
+        <label>Altitude exaggeration <output id="exagOut">1.0×</output>
+          <input id="exag" type="range" min="1" max="5" step="0.1" value="1">
+        </label>
+        <label>Display size
+          <select id="size">
+            <option value="480">480 × 480</option>
+            <option value="720">720 × 720</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="group toggles">
+        <label><input type="checkbox" id="graticule" checked> Graticule</label>
+        <label><input type="checkbox" id="borders" checked> Borders</label>
+        <label><input type="checkbox" id="reticle" checked> Reticle</label>
+        <label><input type="checkbox" id="night"> Night side</label>
+      </div>
+
+      <p class="hint"><b>Orbit view:</b> object fixed at the centre, flying up; the orbit is a vertical line and the Earth turns below. <b>Munich view:</b> Earth fixed, north up, the object passes by. Drag to look around; the view glides back after 4 s (double-click: at once).</p>
+    </aside>
+  </main>
+
+  <script src="vendor/d3-array.min.js"></script>
+  <script src="vendor/d3-geo.min.js"></script>
+  <script src="vendor/topojson-client.min.js"></script>
+  <script src="vendor/satellite.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
