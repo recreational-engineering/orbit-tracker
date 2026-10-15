@@ -22,13 +22,14 @@
   const C = {
     face: '#1a1d1c',
     sea: [34, 78, 172],
-    land: '#7a8f3c',              // fallback until the terrain texture has loaded
-    coast: 'rgba(15, 25, 15, .55)',
+    landRgb: [122, 143, 60],      // fallback until the terrain texture has loaded
+    coastRgb: [15, 25, 15],
     border: 'rgba(20, 20, 20, .5)',
     graticule: 'rgba(255, 255, 255, .16)',
     trackFuture: '#c8102e',
     trackPast: '#ff6b6b',
     mesh: 'rgba(255, 120, 120, .55)',
+    footprint: 'rgba(255, 226, 122, .9)',
     sat: '#ffcc00',
     reticle: 'rgba(30, 30, 30, .55)',
     text: '#e9e3cf',
@@ -58,16 +59,21 @@
     ahead: null,              // same, a few seconds later: flight direction
     sat: null,                // geodetic {lon, lat, alt, vel} for the readouts
     track: [],                // [{t, r, gmst}] ±1 h, ECI
+    menuOpen: false,          // on-screen view menu
+    menuHits: [],             // [{x, y, w, h, mode}] option rects from the last draw
+    topTab: null,             // {yCut, halfWidth} of the top HUD tab (tap = reset view)
+    bottomTab: null,          // {yCut, halfWidth} of the bottom HUD tab (tap = menu)
     nextPass: null,           // Date of the next range minimum to HOME
     marks: [],                // 5-min marks at absolute times: {t, lon, lat, alt, dir: {lon, lat, alt}}
     land: null,
     borders: null,
+    mask: null,               // land mask, Uint8Array MASK_W × MASK_H, 1 = land
     tex: null,                // terrain texture {w, h, px: Uint8ClampedArray}, alpha 0 = water
     lights: null,             // city lights {w, h, px: Uint8Array}, one byte per texel
     dirty: true,
   };
 
-  const projection = d3.geoOrthographic().clipAngle(90).precision(0.3);
+  const projection = d3.geoOrthographic().clipAngle(90).precision(0.7);
   const path = d3.geoPath(projection, ctx);
   const graticule = d3.geoGraticule10();
   const sphere = { type: 'Sphere' };
@@ -90,6 +96,7 @@
       fetch('vendor/countries-110m.json').then((r) => r.json()),
     ]);
     state.land = topojson.feature(land, land.objects.land);
+    buildLandMask();
     state.borders = topojson.mesh(countries, countries.objects.countries, (a, b) => a !== b);
     state.dirty = true;
   }
@@ -145,32 +152,44 @@
     return t * t * (3 - 2 * t);
   };
 
-  // Per-pixel inverse orthographic projection onto the globe. One pass fills three buffers:
-  // terrain colour, night darkening (alpha) and city lights (added on top).
-  const bufs = {};
-  function buffer(name, s) {
-    let b = bufs[name];
-    if (!b || b.width !== s) {
-      b = bufs[name] = document.createElement('canvas');
-      b.width = b.height = s;
-    }
-    return b;
+  // Land mask: land-50m rasterised once to an equirectangular byte grid (1 = land).
+  // Replaces per-frame vector clipping, and its edges give the coastline for free.
+  const MASK_W = 2048, MASK_H = 1024;
+  function buildLandMask() {
+    const c = document.createElement('canvas');
+    c.width = MASK_W; c.height = MASK_H;
+    const g = c.getContext('2d');
+    const eq = d3.geoEquirectangular().scale(MASK_W / (2 * Math.PI)).translate([MASK_W / 2, MASK_H / 2]);
+    g.fillStyle = '#fff';
+    g.beginPath(); d3.geoPath(eq, g)(state.land); g.fill();
+    const src = g.getImageData(0, 0, MASK_W, MASK_H).data;
+    const m = new Uint8Array(MASK_W * MASK_H);
+    for (let i = 0; i < m.length; i++) m[i] = src[i * 4] > 127 ? 1 : 0;
+    state.mask = m;
+    state.dirty = true;
   }
 
+  // Per-pixel inverse orthographic projection onto the globe, one pass into one buffer:
+  // sea / terrain (land mask), coastline (mask edges), night darkening and city lights.
+  let globeBuf = null, globeImg = null;
   function renderGlobePixels(withNight) {
     const s = state.size, r = projection.scale();
     const [cx, cy] = projection.translate();
-    const terrain = buffer('terrain', s), shade = buffer('shade', s), glow = buffer('glow', s);
-    const out = terrain.getContext('2d').createImageData(s, s), o = out.data;
-    const shOut = shade.getContext('2d').createImageData(s, s), so = shOut.data;
-    const glOut = glow.getContext('2d').createImageData(s, s), go = glOut.data;
-    const tex = state.tex, lights = withNight ? state.lights : null;
+    if (!globeBuf || globeBuf.width !== s) {
+      globeBuf = document.createElement('canvas');
+      globeBuf.width = globeBuf.height = s;
+      globeImg = globeBuf.getContext('2d').createImageData(s, s);
+    }
+    const o = globeImg.data;
+    o.fill(0);
+    const tex = state.tex, mask = state.mask, lights = withNight ? state.lights : null;
     // Sun direction in Earth-fixed coordinates.
     const [slon, slat] = subsolarPoint(simTime()).map((d) => d / DEG);
     const sx = Math.cos(slat) * Math.cos(slon), sy = Math.cos(slat) * Math.sin(slon), sz = Math.sin(slat);
     const lam = state.rotate[0] / DEG, phi = state.rotate[1] / DEG, gam = (state.rotate[2] || 0) / DEG;
     const cp = Math.cos(phi), sp = Math.sin(phi), cg = Math.cos(gam), sg2 = Math.sin(gam);
-    const [sr, sg, sb] = C.sea;
+    const cl0 = Math.cos(lam), sl0 = Math.sin(lam);
+    const [sr, sg, sb] = C.sea, [lr, lg, lb] = C.landRgb, [kr, kg, kb] = C.coastRgb;
     const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(s, Math.ceil(cx + r));
     const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(s, Math.ceil(cy + r));
     for (let py = y0; py < y1; py++) {
@@ -189,31 +208,41 @@
         const lat = Math.asin(Math.max(-1, Math.min(1, zr)));
         const fu = ((lon / (2 * Math.PI) + 0.5) % 1 + 1) % 1, fv = Math.min(0.9999, 0.5 - lat / Math.PI);
         const oi = (py * s + pxl) * 4;
-        if (tex) {
-          const ti = (Math.floor(fv * tex.h) * tex.w + Math.floor(fu * tex.w)) * 4, px = tex.px;
-          if (px[ti + 3] === 0) { o[oi] = sr; o[oi + 1] = sg; o[oi + 2] = sb; }
-          else { o[oi] = px[ti]; o[oi + 1] = px[ti + 1]; o[oi + 2] = px[ti + 2]; }
-          o[oi + 3] = 255;
+
+        let R = sr, G = sg, B = sb;
+        let coast = false;
+        if (mask) {
+          const mu = Math.floor(fu * MASK_W), mv = Math.floor(fv * MASK_H), mi = mv * MASK_W + mu;
+          const land = mask[mi];
+          coast = land !== mask[mv * MASK_W + ((mu + 1) % MASK_W)] || (mv + 1 < MASK_H && land !== mask[mi + MASK_W]);
+          if (land) {
+            if (tex) {
+              const ti = (Math.floor(fv * tex.h) * tex.w + Math.floor(fu * tex.w)) * 4, t = tex.px;
+              if (t[ti + 3] !== 0) { R = t[ti]; G = t[ti + 1]; B = t[ti + 2]; }   // else: lake
+            } else { R = lr; G = lg; B = lb; }
+          }
         }
+        if (coast) { R = R * 0.45 + kr * 0.55; G = G * 0.45 + kg * 0.55; B = B * 0.45 + kb * 0.55; }
+
         if (withNight) {
           // Sun elevation → night factor, with a soft twilight band (~+6° … −7°).
-          const cl = Math.cos(lat);
-          const sunDot = cl * Math.cos(lon) * sx + cl * Math.sin(lon) * sy + Math.sin(lat) * sz;
+          // Surface normal in Earth-fixed axes = (xr, X, zr) turned back by λ; no extra trig.
+          const sunDot = (xr * cl0 + X * sl0) * sx + (X * cl0 - xr * sl0) * sy + zr * sz;
           const n = smoothstep(0.1, -0.12, sunDot);
           if (n > 0) {
-            so[oi] = 4; so[oi + 1] = 8; so[oi + 2] = 28; so[oi + 3] = 200 * n;
+            const a = 0.78 * n;
+            R = R * (1 - a) + 4 * a; G = G * (1 - a) + 8 * a; B = B * (1 - a) + 28 * a;
             if (lights) {
               const L = lights.px[Math.floor(fv * lights.h) * lights.w + Math.floor(fu * lights.w)] * n;
-              go[oi] = L; go[oi + 1] = L * 0.8; go[oi + 2] = L * 0.45; go[oi + 3] = 255;
+              R += L; G += L * 0.8; B += L * 0.45;
             }
           }
         }
+        o[oi] = R; o[oi + 1] = G; o[oi + 2] = B; o[oi + 3] = 255;   // Uint8Clamped clamps
       }
     }
-    terrain.getContext('2d').putImageData(out, 0, 0);
-    shade.getContext('2d').putImageData(shOut, 0, 0);
-    glow.getContext('2d').putImageData(glOut, 0, 0);
-    return { terrain, shade, glow };
+    globeBuf.getContext('2d').putImageData(globeImg, 0, 0);
+    return globeBuf;
   }
 
   async function loadSatellite(catnr) {
@@ -387,6 +416,7 @@
   }
 
   // ---------- rendering ----------
+  const perf = window.__perf = { pixels: 0, total: 0 };   // last frame's timings (ms)
   function draw() {
     const s = state.size;
     const r = projection.scale();
@@ -412,26 +442,12 @@
     ctx.fill();
     ctx.restore();
 
-    // Sea + terrain.
+    // Sea, terrain, coastline, night side and city lights: one per-pixel pass.
     ctx.save();
     ctx.beginPath(); path(sphere); ctx.clip();
-    ctx.fillStyle = `rgb(${C.sea})`; ctx.fill();
-    const night = ui.night.checked;
-    const px = state.tex || night ? renderGlobePixels(night) : null;
-    if (state.land) {
-      // Terrain only inside the vector coastline keeps the sea a clean, flat blue.
-      ctx.save();
-      ctx.beginPath(); path(state.land); ctx.clip();
-      if (state.tex) ctx.drawImage(px.terrain, 0, 0);
-      else { ctx.fillStyle = C.land; ctx.fill(); }
-      ctx.restore();
-    }
-
-    if (state.land) {
-      ctx.lineJoin = 'round';
-      ctx.beginPath(); path(state.land);
-      ctx.strokeStyle = C.coast; ctx.lineWidth = Math.max(0.6, s / 800); ctx.stroke();
-    }
+    const tp = performance.now();
+    ctx.drawImage(renderGlobePixels(ui.night.checked), 0, 0);
+    perf.pixels = performance.now() - tp;
 
     if (ui.borders.checked && state.borders) {
       ctx.beginPath(); path(state.borders);
@@ -445,15 +461,8 @@
       ctx.strokeStyle = C.graticule; ctx.lineWidth = 0.6; ctx.stroke();
     }
 
-    if (night) {
-      // Darken the night side, then add the city lights on top.
-      ctx.drawImage(px.shade, 0, 0);
-      ctx.globalCompositeOperation = 'lighter';
-      ctx.drawImage(px.glow, 0, 0);
-      ctx.globalCompositeOperation = 'source-over';
-    }
-
     if (state.mode === 'orbit') drawMarkMesh();
+    drawFootprint();
 
     drawGlobeShading(cx, cy, r);
     ctx.restore();
@@ -464,6 +473,7 @@
     if (state.mode === 'home') drawMarkTicks();
     drawSatellite();
     drawHud();
+    if (state.menuOpen) drawMenu();
   }
 
   // Soviet-instrument style lighting: lit from upper left, dark limb, glass glint.
@@ -580,6 +590,20 @@
       ctx.globalAlpha = 1 - 0.5 * Math.abs(m.t) / TRACK_SPAN_S;
       ctx.beginPath(); path({ type: 'LineString', coordinates: coords }); ctx.stroke();
     }
+    ctx.restore();
+  }
+
+  // Both views: the object's horizon on the ground — every point that sees it at 0°
+  // elevation lies on a small circle around the sub-satellite point, radius acos(R / (R + h)).
+  function drawFootprint() {
+    if (!state.now) return;
+    const g = geoOf(state.now.r, state.now.gmst);
+    const radius = Math.acos(EARTH_R_KM / (EARTH_R_KM + g.alt)) * DEG;
+    const s = state.size;
+    ctx.save();
+    ctx.strokeStyle = C.footprint;
+    ctx.lineWidth = Math.max(1, s / 420);
+    ctx.beginPath(); path(d3.geoCircle().center([g.lon, g.lat]).radius(radius).precision(2)()); ctx.stroke();
     ctx.restore();
   }
 
@@ -843,7 +867,9 @@
     // Top tab: UTC time.
     const timeRow = [{ value: simTime().toISOString().slice(11, 19), unit: 'UTC' }];
     const tfs = Math.round(s * 0.034);
-    edgeBand(s * 0.068, readoutRow(timeRow, 0, tfs, false) / 2 + pad, true);
+    const tHalf = readoutRow(timeRow, 0, tfs, false) / 2 + pad;
+    edgeBand(s * 0.068, tHalf, true);
+    state.topTab = { yCut: s * 0.068, halfWidth: tHalf };
     readoutRow(timeRow, s * 0.038, tfs);
 
     // Bottom tab: primary row (distance to Munich, next pass), secondary row (position, altitude).
@@ -860,9 +886,11 @@
       ];
       const pfs = Math.round(s * 0.038), sfs = Math.round(s * 0.028);
       // The flat edge only has to fit the first row; the flanks widen toward the second.
-      edgeBand(s * 0.855, readoutRow(primary, 0, pfs, false) / 2 + pad, false);
-      readoutRow(primary, s * 0.888, pfs);
-      readoutRow(secondary, s * 0.935, sfs);
+      const half = readoutRow(primary, 0, pfs, false) / 2 + pad;
+      edgeBand(s * 0.88, half, false);
+      state.bottomTab = { yCut: s * 0.88, halfWidth: half };
+      readoutRow(primary, s * 0.912, pfs);
+      readoutRow(secondary, s * 0.957, sfs);
     }
     ctx.restore();
   }
@@ -885,15 +913,114 @@
     ui.readout.innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
   }
 
+  // ---------- on-screen menu ----------
+  const MODES = [
+    { mode: 'orbit', label: 'Orbit view', icon: 'orbit' },
+    { mode: 'home', label: 'Ground view', icon: 'pin' },
+  ];
+
+  // Orbit-view icon: globe with the vertical orbit line and the object at its centre.
+  ICONS.orbit = (x, y, h) => {
+    const r = h * 0.42;
+    ctx.save();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = Math.max(1.5, h * 0.1);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, y - r * 1.25); ctx.lineTo(x, y + r * 1.25); ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(x, y, h * 0.13, 0, 2 * Math.PI); ctx.fill();
+    ctx.restore();
+  };
+
+  function drawMenu() {
+    const s = state.size, c = s / 2;
+    ctx.save();
+    // Dim everything behind the menu.
+    ctx.beginPath(); ctx.arc(c, c, c, 0, 2 * Math.PI); ctx.clip();
+    ctx.fillStyle = 'rgba(0,0,0,.45)';
+    ctx.fillRect(0, 0, s, s);
+
+    const w = s * 0.5, rowH = s * 0.085, head = s * 0.075;
+    const h = head + rowH * MODES.length + s * 0.03;
+    const x = c - w / 2, y = c - h / 2;
+    ctx.fillStyle = 'rgba(16,17,19,.94)';
+    ctx.strokeStyle = 'rgba(255,255,255,.18)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.roundRect(x, y, w, h, s * 0.02); ctx.fill(); ctx.stroke();
+
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+    ctx.font = `500 ${Math.round(s * 0.026)}px ${HUD_FONT}`;
+    ctx.letterSpacing = `${(s * 0.004).toFixed(1)}px`;
+    ctx.fillStyle = 'rgba(255,255,255,.55)';
+    ctx.fillText('VIEW', c, y + head * 0.55);
+    ctx.letterSpacing = '0px';
+
+    state.menuHits = [];
+    const fs = Math.round(s * 0.038);
+    MODES.forEach((m, i) => {
+      const ry = y + head + i * rowH;
+      const active = state.mode === m.mode;
+      if (active) {
+        ctx.fillStyle = 'rgba(255,255,255,.10)';
+        ctx.fillRect(x + s * 0.012, ry + rowH * 0.08, w - s * 0.024, rowH * 0.84);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(x + s * 0.012, ry + rowH * 0.08, Math.max(2, s * 0.005), rowH * 0.84);
+      }
+      ctx.globalAlpha = active ? 1 : 0.7;
+      ctx.fillStyle = '#fff';
+      ICONS[m.icon](x + s * 0.06, ry + rowH / 2, fs * 0.8);
+      ctx.textAlign = 'left';
+      hudText(m.label, x + s * 0.1, ry + rowH / 2, fs, 600, false);
+      ctx.globalAlpha = 1;
+      state.menuHits.push({ x, y: ry, w, h: rowH, mode: m.mode });
+    });
+    ctx.restore();
+  }
+
+  function openMenu(open) {
+    state.menuOpen = open;
+    state.dirty = true;
+  }
+
+  // A tap (no drag) on the display, in canvas pixels.
+  function onTap(px, py) {
+    const s = state.size, c = s / 2;
+    if (state.menuOpen) {
+      const hit = state.menuHits.find((r) => px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h);
+      if (hit) setMode(hit.mode);
+      openMenu(false);   // any tap closes: selection or outside
+      return;
+    }
+    // Inside a tab: beyond its flat edge and between its angled flanks (on screen).
+    const inTab = (b, top) => {
+      if (!b || Math.hypot(px - c, py - c) > c) return false;
+      const depth = top ? b.yCut - py : py - b.yCut;
+      return depth >= 0 && Math.abs(px - c) <= b.halfWidth + depth / Math.tan(BAND_ANGLE);
+    };
+    if (inTab(state.bottomTab, false)) openMenu(true);
+    else if (inTab(state.topTab, true)) resetView();
+  }
+
+  // Drop any manual pan and glide back to the current mode's default orientation.
+  function resetView() {
+    state.manualUntil = 0;
+    state.vel = [0, 0];
+    state.dirty = true;
+  }
+
   // ---------- interaction ----------
   // Ease the view toward the mode's orientation (short way round for λ and γ).
+  // Time-based, so the glide takes the same ~0.6 s at any frame rate (ESP32 included).
+  const GLIDE_TAU_S = 0.15;
+  let lastEase = 0;
   function easeToTarget() {
+    const now = performance.now(), dt = Math.min(0.5, (now - (lastEase || now)) / 1000);
+    lastEase = now;
     const t = targetRotation();
     if (!t) return;
     const wrap = (d) => ((d + 540) % 360) - 180;
     const d = [wrap(t[0] - state.rotate[0]), t[1] - state.rotate[1], wrap(t[2] - (state.rotate[2] || 0))];
     if (d.every((v) => Math.abs(v) < 0.005)) { state.rotate = t; return; }
-    const k = d.every((v) => Math.abs(v) < 0.5) ? 1 : 0.12;   // glide in, then lock on
+    const k = d.every((v) => Math.abs(v) < 0.5) ? 1 : 1 - Math.exp(-dt / GLIDE_TAU_S);   // glide in, then lock on
     state.rotate = [wrap(state.rotate[0] + d[0] * k), state.rotate[1] + d[1] * k, wrap((state.rotate[2] || 0) + d[2] * k)];
     state.dirty = true;
   }
@@ -905,30 +1032,39 @@
     state.dirty = true;
   }
 
+  // Pointer: a drag rotates the globe; a tap without movement goes to onTap().
+  const TAP_SLOP_PX = 6;
   let drag = null;
   canvas.addEventListener('pointerdown', (e) => {
     canvas.setPointerCapture(e.pointerId);
-    canvas.classList.add('dragging');
-    drag = { x: e.clientX, y: e.clientY };
+    drag = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: false };
     state.vel = [0, 0];
   });
   canvas.addEventListener('pointermove', (e) => {
-    if (!drag) return;
+    if (!drag || state.menuOpen) return;
+    if (!drag.moved && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < TAP_SLOP_PX) return;
+    drag.moved = true;
+    canvas.classList.add('dragging');
     const k = DEG / projection.scale();   // one globe radius ≈ 57°
     const dx = (e.clientX - drag.x) * k;
     const dy = (e.clientY - drag.y) * k;
-    drag = { x: e.clientX, y: e.clientY };
+    drag.x = e.clientX; drag.y = e.clientY;
     rotateBy(dx, dy);
     state.vel = [dx, dy];
   });
-  const endDrag = () => {
+  canvas.addEventListener('pointerup', (e) => {
+    if (drag && !drag.moved) {
+      const rect = canvas.getBoundingClientRect();
+      onTap((e.clientX - rect.left) * canvas.width / rect.width, (e.clientY - rect.top) * canvas.height / rect.height);
+    } else if (drag) {
+      state.manualUntil = performance.now() + 4000;   // then glide back to the mode's view
+    }
     drag = null;
     canvas.classList.remove('dragging');
-    state.manualUntil = performance.now() + 4000;   // then glide back to the mode's view
-  };
-  canvas.addEventListener('pointerup', endDrag);
-  canvas.addEventListener('pointercancel', endDrag);
-  canvas.addEventListener('dblclick', () => { state.manualUntil = 0; state.vel = [0, 0]; });
+  });
+  canvas.addEventListener('pointercancel', () => { drag = null; canvas.classList.remove('dragging'); });
+  canvas.addEventListener('dblclick', resetView);
+  window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.menuOpen) openMenu(false); });
 
   function rotateBy(dLon, dLat) {
     state.rotate[0] = ((state.rotate[0] + dLon + 540) % 360) - 180;
@@ -969,7 +1105,12 @@
       state.vel = state.vel.map((v) => v * 0.92);
     }
     if (!drag && ts > state.manualUntil) easeToTarget();
-    if (state.dirty) { state.dirty = false; draw(); }
+    if (state.dirty) {
+      state.dirty = false;
+      const t0 = performance.now();
+      draw();
+      perf.total = performance.now() - t0;
+    }
     requestAnimationFrame(frame);
   }
 
