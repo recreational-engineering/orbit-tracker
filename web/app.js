@@ -73,8 +73,15 @@
     dirty: true,
   };
 
-  const projection = d3.geoOrthographic().clipAngle(90).precision(0.7);
+  // Two projections share the same disc on screen: orthographic globe (orbit / ground view)
+  // and a north-pole-centred azimuthal equidistant map (flat view, whole Earth in the disc).
+  const GLOBE_FRAC = 0.43;   // disc radius / display size
+  const ortho = d3.geoOrthographic().clipAngle(90).precision(0.7);
+  const azeq = d3.geoAzimuthalEquidistant().clipAngle(179.999).precision(0.7);
+  let projection = ortho;
   const path = d3.geoPath(projection, ctx);
+  const isFlat = () => state.mode === 'flat';
+  const discRadius = () => state.size * GLOBE_FRAC;
   const graticule = d3.geoGraticule10();
   const sphere = { type: 'Sphere' };
 
@@ -85,7 +92,8 @@
     canvas.style.width = s + 'px';
     canvas.style.height = s + 'px';
     // Globe fills most of the round screen, leaving a narrow ring for the shadow.
-    projection.scale(s * 0.43).translate([s / 2, s / 2]);
+    ortho.scale(s * GLOBE_FRAC).translate([s / 2, s / 2]);
+    azeq.scale(s * GLOBE_FRAC / Math.PI).translate([s / 2, s / 2]);   // 180° from the pole = rim
     state.dirty = true;
   }
 
@@ -173,7 +181,7 @@
   // sea / terrain (land mask), coastline (mask edges), night darkening and city lights.
   let globeBuf = null, globeImg = null;
   function renderGlobePixels(withNight) {
-    const s = state.size, r = projection.scale();
+    const s = state.size, r = discRadius(), flat = isFlat();
     const [cx, cy] = projection.translate();
     if (!globeBuf || globeBuf.width !== s) {
       globeBuf = document.createElement('canvas');
@@ -198,14 +206,26 @@
         const Xs = (pxl + 0.5 - cx) / r;
         const d = Xs * Xs + Ys * Ys;
         if (d > 1) continue;
-        const Z = Math.sqrt(1 - d);
-        // Undo d3's [λ, φ, γ] rotation: spin back by γ, tilt back by φ, shift longitude by λ.
-        const X = Xs * cg + Ys * sg2;
-        const Y = Ys * cg - Xs * sg2;
-        const xr = Z * cp + Y * sp;
-        const zr = Y * cp - Z * sp;
-        const lon = Math.atan2(X, xr) - lam;
-        const lat = Math.asin(Math.max(-1, Math.min(1, zr)));
+        let lon, lat, ex, ey, ez;   // geographic position and Earth-fixed unit normal
+        if (flat) {
+          // Azimuthal equidistant around the north pole: radius ∝ polar distance,
+          // Greenwich pointing down, longitude increasing counter-clockwise.
+          lat = Math.PI / 2 - Math.sqrt(d) * Math.PI;
+          lon = Math.atan2(Xs, -Ys) - lam;
+          const cl = Math.cos(lat);
+          ex = cl * Math.cos(lon); ey = cl * Math.sin(lon); ez = Math.sin(lat);
+        } else {
+          const Z = Math.sqrt(1 - d);
+          // Undo d3's [λ, φ, γ] rotation: spin back by γ, tilt back by φ, shift longitude by λ.
+          const X = Xs * cg + Ys * sg2;
+          const Y = Ys * cg - Xs * sg2;
+          const xr = Z * cp + Y * sp;
+          const zr = Y * cp - Z * sp;
+          lon = Math.atan2(X, xr) - lam;
+          lat = Math.asin(Math.max(-1, Math.min(1, zr)));
+          // Surface normal in Earth-fixed axes = (xr, X, zr) turned back by λ; no extra trig.
+          ex = xr * cl0 + X * sl0; ey = X * cl0 - xr * sl0; ez = zr;
+        }
         const fu = ((lon / (2 * Math.PI) + 0.5) % 1 + 1) % 1, fv = Math.min(0.9999, 0.5 - lat / Math.PI);
         const oi = (py * s + pxl) * 4;
 
@@ -226,8 +246,7 @@
 
         if (withNight) {
           // Sun elevation → night factor, with a soft twilight band (~+6° … −7°).
-          // Surface normal in Earth-fixed axes = (xr, X, zr) turned back by λ; no extra trig.
-          const sunDot = (xr * cl0 + X * sl0) * sx + (X * cl0 - xr * sl0) * sy + zr * sz;
+          const sunDot = ex * sx + ey * sy + ez * sz;
           const n = smoothstep(0.1, -0.12, sunDot);
           if (n > 0) {
             const a = 0.78 * n;
@@ -372,6 +391,7 @@
   // View orientation the current mode wants.
   function targetRotation() {
     if (state.mode === 'home') return [-HOME.lon, -HOME.lat, 0];
+    if (state.mode === 'flat') return [0, -90, 0];
     if (!state.now || !state.ahead) return null;
     const p = geoOf(state.now.r, state.now.gmst);
     const q = geoOf(state.ahead.r, state.now.gmst);
@@ -386,6 +406,12 @@
 
   // Project a point at altitude: returns screen x/y plus whether the Earth hides it.
   function project3d(lon, lat, altKm) {
+    if (isFlat()) {
+      // Flat map: ground position only, nothing is ever hidden.
+      const [x, y] = projection([lon, lat]);
+      const [cx, cy] = projection.translate();
+      return { x, y, hidden: false, front: true, v: [x - cx, cy - y, 0] };
+    }
     const [l, p] = d3.geoRotation(projection.rotate())([lon, lat]).map((d) => d / DEG);
     const r = projection.scale();
     const k = r * (1 + (Number(ui.exag.value) * altKm) / EARTH_R_KM);
@@ -419,7 +445,7 @@
   const perf = window.__perf = { pixels: 0, total: 0 };   // last frame's timings (ms)
   function draw() {
     const s = state.size;
-    const r = projection.scale();
+    const r = discRadius();
     const [cx, cy] = projection.translate();
     projection.rotate(state.rotate);
 
@@ -464,13 +490,13 @@
     if (state.mode === 'orbit') drawMarkMesh();
     drawFootprint();
 
-    drawGlobeShading(cx, cy, r);
+    if (isFlat()) drawFlatShading(cx, cy, r); else drawGlobeShading(cx, cy, r);
     ctx.restore();
 
-    if (ui.reticle.checked) drawReticle(cx, cy, r);
+    if (ui.reticle.checked && !isFlat()) drawReticle(cx, cy, r);
     drawHome();
     drawTrack();
-    if (state.mode === 'home') drawMarkTicks();
+    if (state.mode !== 'orbit') drawMarkTicks();
     drawSatellite();
     drawHud();
     if (state.menuOpen) drawMenu();
@@ -519,6 +545,25 @@
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'left';
     hudText(HOME.name.toUpperCase(), p.x + rr * 2, p.y, Math.round(s / 36), 500);
+    ctx.restore();
+  }
+
+  // Flat map: no sphere lighting, just a soft rim vignette and the same glass glint.
+  function drawFlatShading(cx, cy, r) {
+    const rim = ctx.createRadialGradient(cx, cy, r * 0.8, cx, cy, r);
+    rim.addColorStop(0, 'rgba(0,0,0,0)');
+    rim.addColorStop(1, 'rgba(0,0,0,.35)');
+    ctx.fillStyle = rim;
+    ctx.fillRect(cx - r, cy - r, 2 * r, 2 * r);
+    ctx.save();
+    ctx.translate(cx - r * 0.38, cy - r * 0.48);
+    ctx.rotate(-0.6);
+    const glint = ctx.createRadialGradient(0, 0, 0, 0, 0, r * 0.32);
+    glint.addColorStop(0, 'rgba(255,255,255,.22)');
+    glint.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.scale(1, 0.55);
+    ctx.fillStyle = glint;
+    ctx.beginPath(); ctx.arc(0, 0, r * 0.32, 0, 2 * Math.PI); ctx.fill();
     ctx.restore();
   }
 
@@ -917,7 +962,21 @@
   const MODES = [
     { mode: 'orbit', label: 'Orbit view', icon: 'orbit' },
     { mode: 'home', label: 'Ground view', icon: 'pin' },
+    { mode: 'flat', label: 'Flat earth', icon: 'flat' },
   ];
+
+  // Flat-map icon: disc with polar-grid rings and meridians.
+  ICONS.flat = (x, y, h) => {
+    const r = h * 0.45;
+    ctx.save();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = Math.max(1.2, h * 0.08);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, y, r * 0.5, 0, 2 * Math.PI); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x - r, y); ctx.lineTo(x + r, y); ctx.moveTo(x, y - r); ctx.lineTo(x, y + r);
+    ctx.stroke();
+    ctx.restore();
+  };
 
   // Orbit-view icon: globe with the vertical orbit line and the object at its centre.
   ICONS.orbit = (x, y, h) => {
@@ -969,7 +1028,7 @@
       ctx.fillStyle = '#fff';
       ICONS[m.icon](x + s * 0.06, ry + rowH / 2, fs * 0.8);
       ctx.textAlign = 'left';
-      hudText(m.label, x + s * 0.1, ry + rowH / 2, fs, 600, false);
+      hudText(m.label.toUpperCase(), x + s * 0.1, ry + rowH / 2, fs, 600, false);
       ctx.globalAlpha = 1;
       state.menuHits.push({ x, y: ry, w, h: rowH, mode: m.mode });
     });
@@ -1026,8 +1085,12 @@
   }
 
   function setMode(mode) {
+    const wasFlat = isFlat();
     state.mode = mode;
     state.manualUntil = 0;
+    projection = isFlat() ? azeq : ortho;
+    path.projection(projection);
+    if (wasFlat !== isFlat()) state.rotate = targetRotation() || [0, -90, 0];   // no glide across projections
     for (const b of ui.modes) b.classList.toggle('active', b.dataset.mode === mode);
     state.dirty = true;
   }
@@ -1045,7 +1108,7 @@
     if (!drag.moved && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < TAP_SLOP_PX) return;
     drag.moved = true;
     canvas.classList.add('dragging');
-    const k = DEG / projection.scale();   // one globe radius ≈ 57°
+    const k = DEG / discRadius();   // one disc radius ≈ 57°
     const dx = (e.clientX - drag.x) * k;
     const dy = (e.clientY - drag.y) * k;
     drag.x = e.clientX; drag.y = e.clientY;
@@ -1068,6 +1131,7 @@
 
   function rotateBy(dLon, dLat) {
     state.rotate[0] = ((state.rotate[0] + dLon + 540) % 360) - 180;
+    if (isFlat()) { state.dirty = true; return; }   // flat map only spins around the pole
     state.rotate[1] = Math.max(-90, Math.min(90, state.rotate[1] - dLat));
     state.dirty = true;
   }
@@ -1087,7 +1151,10 @@
   ui.size.addEventListener('change', () => { state.size = Number(ui.size.value); layout(); });
   for (const b of ui.modes) b.addEventListener('click', () => setMode(b.dataset.mode));
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'm' && e.target === document.body) setMode(state.mode === 'orbit' ? 'home' : 'orbit');
+    if (e.key === 'm' && e.target === document.body) {
+      const order = MODES.map((m) => m.mode);
+      setMode(order[(order.indexOf(state.mode) + 1) % order.length]);
+    }
   });
   for (const el of [ui.graticule, ui.borders, ui.reticle, ui.night]) {
     el.addEventListener('change', () => { state.dirty = true; });

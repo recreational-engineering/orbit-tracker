@@ -33,10 +33,16 @@ display size.
   View roll γ comes from the projected flight direction (`targetRotation()`).
 - `home` — Earth fixed, Munich (48.137°N, 11.575°E) centred, north up. Track
   uses each point's own GMST (ground-relative path).
+- `flat` ("Flat earth") — azimuthal equidistant projection centred on the north
+  pole, whole Earth in the disc (south pole = rim), Greenwich pointing down,
+  longitude increasing counter-clockwise. Per-pixel inverse: polar distance =
+  (r / R)·180°, lon = atan2(x, −y) − λ. Ground-relative track drawn on the
+  ground (nothing hidden), 5-min ticks, horizon circle; no sphere lighting
+  (rim vignette + glint only), no reticle. Dragging only spins around the pole.
 - Dragging pans temporarily; the view glides back after 4 s.
 - On-screen menu (`drawMenu()`, `onTap()`): a tap (pointer moved < 6 px) on the
   bottom HUD tab opens a centred "VIEW" panel with
-  Orbit view / Ground view (icon + label, active row highlighted with a white
+  ORBIT VIEW / GROUND VIEW / FLAT EARTH (icon + upper-case label, active row highlighted with a white
   bar). Tapping an option switches mode and closes; tapping outside closes.
   `home` mode is labelled "Ground view" in the UI.
 - Tapping the top HUD tab (time) resets the view: drops any manual pan and
