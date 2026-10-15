@@ -82,6 +82,9 @@
   let projection = ortho;
   const path = d3.geoPath(projection, ctx);
   const isFlat = () => state.mode === 'flat';
+  const isPilot = () => state.mode === 'pilot';
+  const viewKind = (m) => (m === 'flat' ? 'flat' : m === 'pilot' ? 'pilot' : 'globe');
+  const PILOT_HALF_FOV = 55 / DEG;   // angle from view centre to the screen edge
   const discRadius = () => state.size * GLOBE_FRAC;
   const graticule = d3.geoGraticule10();
   const sphere = { type: 'Sphere' };
@@ -182,7 +185,8 @@
   // sea / terrain (land mask), coastline (mask edges), night darkening and city lights.
   let globeBuf = null, globeImg = null;
   function renderGlobePixels(withNight) {
-    const s = state.size, r = discRadius(), flat = isFlat();
+    const s = state.size, flat = isFlat(), cam = isPilot() ? state.cam : null;
+    const r = cam ? s / 2 : discRadius();   // pilot view fills the whole round screen
     const [cx, cy] = projection.translate();
     if (!globeBuf || globeBuf.width !== s) {
       globeBuf = document.createElement('canvas');
@@ -198,6 +202,12 @@
     const lam = state.rotate[0] / DEG, phi = state.rotate[1] / DEG, gam = (state.rotate[2] || 0) / DEG;
     const cp = Math.cos(phi), sp = Math.sin(phi), cg = Math.cos(gam), sg2 = Math.sin(gam);
     const cl0 = Math.cos(lam), sl0 = Math.sin(lam);
+    // Pilot camera: ray = f + X·tanH·rt + Y·tanH·u; Earth is a sphere of radius EARTH_R_KM.
+    const tanH = Math.tan(PILOT_HALF_FOV), pixAng = 2 * tanH / s;
+    const gm = cam ? cam.gmst : 0, cgm = Math.cos(gm), sgm = Math.sin(gm);
+    const RE = EARTH_R_KM, cc2 = cam ? cam.c[0] ** 2 + cam.c[1] ** 2 + cam.c[2] ** 2 : 0;
+    const tHorizon = Math.sqrt(Math.max(0, cc2 - RE * RE));
+    const grat = cam && ui.graticule.checked;
     const [sr, sg, sb] = C.sea, [lr, lg, lb] = C.landRgb, [kr, kg, kb] = C.coastRgb;
     const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(s, Math.ceil(cx + r));
     const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(s, Math.ceil(cy + r));
@@ -208,7 +218,35 @@
         const d = Xs * Xs + Ys * Ys;
         if (d > 1) continue;
         let lon, lat, ex, ey, ez;   // geographic position and Earth-fixed unit normal
-        if (flat) {
+        let hitT = 0;               // pilot: distance from the camera to the ground point (km)
+        if (cam) {
+          const { c, f, u, rt } = cam;
+          let dx = f[0] + (Xs * rt[0] + Ys * u[0]) * tanH;
+          let dy = f[1] + (Xs * rt[1] + Ys * u[1]) * tanH;
+          let dz = f[2] + (Xs * rt[2] + Ys * u[2]) * tanH;
+          const dn = Math.hypot(dx, dy, dz); dx /= dn; dy /= dn; dz /= dn;
+          const b = c[0] * dx + c[1] * dy + c[2] * dz;
+          const disc = b * b - (cc2 - RE * RE);
+          const t = disc >= 0 ? -b - Math.sqrt(disc) : -1;
+          if (t <= 0) {
+            // Sky: black space with a thin atmosphere glow along the limb, lit on the day side.
+            const tc = Math.max(0, -b);                     // closest approach along the ray
+            const qx = c[0] + tc * dx, qy = c[1] + tc * dy, qz = c[2] + tc * dz;
+            const qn = Math.hypot(qx, qy, qz);
+            const glow = Math.exp(-Math.max(0, qn - RE) / 90);
+            const sd = ((qx * cgm + qy * sgm) * sx + (-qx * sgm + qy * cgm) * sy + qz * sz) / qn;
+            const lit = smoothstep(-0.2, 0.15, sd);
+            const oi = (py * s + pxl) * 4;
+            o[oi] = 4 + 90 * glow * lit; o[oi + 1] = 6 + 150 * glow * lit; o[oi + 2] = 14 + 255 * glow * (0.15 + 0.85 * lit);
+            o[oi + 3] = 255;
+            continue;
+          }
+          hitT = t;
+          const nx = (c[0] + t * dx) / RE, ny = (c[1] + t * dy) / RE, nz = (c[2] + t * dz) / RE;
+          ex = nx * cgm + ny * sgm; ey = -nx * sgm + ny * cgm; ez = nz;   // ECI → Earth-fixed
+          lon = Math.atan2(ey, ex);
+          lat = Math.asin(Math.max(-1, Math.min(1, ez)));
+        } else if (flat) {
           // Azimuthal equidistant around the north pole: radius ∝ polar distance,
           // Greenwich pointing down, longitude increasing counter-clockwise.
           lat = Math.PI / 2 - Math.sqrt(d) * Math.PI;
@@ -257,6 +295,20 @@
               R += L; G += L * 0.8; B += L * 0.45;
             }
           }
+        }
+        if (cam) {
+          if (grat) {
+            // Graticule every 10°, line width ≈ one pixel's footprint on the ground.
+            const fp = hitT * pixAng / RE * DEG * 0.8;
+            const la = lat * DEG, lo = lon * DEG;
+            const dLat = Math.abs(la - Math.round(la / 10) * 10);
+            const dLon = Math.abs(lo - Math.round(lo / 10) * 10) * Math.cos(lat);
+            if (dLat < fp || dLon < fp) { R = R * 0.8 + 51; G = G * 0.8 + 51; B = B * 0.8 + 51; }
+          }
+          // Aerial haze toward the horizon.
+          const sd = ex * sx + ey * sy + ez * sz, lit = smoothstep(-0.12, 0.1, sd);
+          const hz = 0.6 * Math.pow(Math.min(1, hitT / tHorizon), 5);
+          R = R * (1 - hz) + (12 + 120 * lit) * hz; G = G * (1 - hz) + (18 + 160 * lit) * hz; B = B * (1 - hz) + (40 + 210 * lit) * hz;
         }
         o[oi] = R; o[oi + 1] = G; o[oi + 2] = B; o[oi + 3] = 255;   // Uint8Clamped clamps
       }
@@ -316,7 +368,7 @@
 
   // Frame in which the track and the flight direction are drawn.
   function frameGmst(pt) {
-    return state.mode === 'orbit' ? state.now.gmst : pt.gmst;
+    return state.mode === 'orbit' || state.mode === 'pilot' ? state.now.gmst : pt.gmst;
   }
 
   // Runs every frame: object position at the displayed time.
@@ -393,6 +445,7 @@
   function targetRotation() {
     if (state.mode === 'home') return [-HOME.lon, -HOME.lat, 0];
     if (state.mode === 'flat') return [0, -90, 0];
+    if (state.mode === 'pilot') return [0, 0, 0];   // no look-around offset
     if (!state.now || !state.ahead) return null;
     const p = geoOf(state.now.r, state.now.gmst);
     const q = geoOf(state.ahead.r, state.now.gmst);
@@ -405,13 +458,52 @@
     return [-p.lon, -p.lat, heading];
   }
 
+  // Pilot view camera at the object: forward = prograde (inertial velocity), up = radial
+  // out, then the user's look-around offsets (yaw = −rotate[0], pitch = −rotate[1]).
+  const vnorm = (a) => { const n = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / n, a[1] / n, a[2] / n]; };
+  const vdot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const vcross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  function updateCamera() {
+    if (!state.now) { state.cam = null; return; }
+    const c = state.now.r, v = state.now.v;
+    let f = vnorm([v.x, v.y, v.z]);
+    let u = vnorm(c.map((x, i) => x - vdot(c, f) * f[i]));
+    let rt = vcross(f, u);
+    const yaw = -state.rotate[0] / DEG, pitch = -state.rotate[1] / DEG;
+    const f1 = f.map((x, i) => x * Math.cos(yaw) + rt[i] * Math.sin(yaw));
+    rt = rt.map((x, i) => x * Math.cos(yaw) - f[i] * Math.sin(yaw));
+    f = f1.map((x, i) => x * Math.cos(pitch) + u[i] * Math.sin(pitch));
+    u = u.map((x, i) => x * Math.cos(pitch) - f1[i] * Math.sin(pitch));
+    state.cam = { c, f, u, rt, gmst: state.now.gmst };
+  }
+
+  // Perspective projection from the pilot camera. Lon/lat are in the frame of the camera's
+  // GMST (inertial frame, like orbit view). inView = in front of the camera.
+  function projectPilot(lon, lat, altKm) {
+    const cam = state.cam, s = state.size;
+    const rr = EARTH_R_KM + altKm, la = lat / DEG, lo = lon / DEG + cam.gmst;
+    const P = [rr * Math.cos(la) * Math.cos(lo), rr * Math.cos(la) * Math.sin(lo), rr * Math.sin(la)];
+    const rel = [P[0] - cam.c[0], P[1] - cam.c[1], P[2] - cam.c[2]];
+    const z = vdot(rel, cam.f);
+    if (z <= 1e-6) return { x: 0, y: 0, hidden: true, front: false, inView: false, v: [0, 0, 0] };
+    const k = (s / 2) / Math.tan(PILOT_HALF_FOV);
+    const x = s / 2 + k * vdot(rel, cam.rt) / z, y = s / 2 - k * vdot(rel, cam.u) / z;
+    // Hidden if the line of sight meets the Earth before reaching the point.
+    const dist = Math.hypot(...rel), d = rel.map((q) => q / dist);
+    const b = vdot(cam.c, d), disc = b * b - (vdot(cam.c, cam.c) - EARTH_R_KM ** 2);
+    const t1 = disc >= 0 ? -b - Math.sqrt(disc) : -1;
+    const hidden = t1 > 0 && t1 < dist - 1e-3;
+    return { x, y, hidden, front: !hidden, inView: true, v: [0, 0, 0] };
+  }
+
   // Project a point at altitude: returns screen x/y plus whether the Earth hides it.
   function project3d(lon, lat, altKm) {
+    if (isPilot()) return state.cam ? projectPilot(lon, lat, altKm) : { x: 0, y: 0, hidden: true, front: false, inView: false, v: [0, 0, 0] };
     if (isFlat()) {
       // Flat map: ground position only, nothing is ever hidden.
       const [x, y] = projection([lon, lat]);
       const [cx, cy] = projection.translate();
-      return { x, y, hidden: false, front: true, v: [x - cx, cy - y, 0] };
+      return { x, y, hidden: false, front: true, inView: true, v: [x - cx, cy - y, 0] };
     }
     const [l, p] = d3.geoRotation(projection.rotate())([lon, lat]).map((d) => d / DEG);
     const r = projection.scale();
@@ -424,7 +516,7 @@
     const y = cy - k * ey;
     const hidden = ez < 0 && k * Math.hypot(ex, ey) < r;
     // v: view-space position (x right, y up, z toward the viewer), in screen pixels.
-    return { x, y, hidden, front: ez >= 0, v: [k * ex, k * ey, k * ez] };
+    return { x, y, hidden, front: ez >= 0, inView: true, v: [k * ex, k * ey, k * ez] };
   }
 
   // Approximate subsolar point (good to ~0.5°, plenty for shading).
@@ -445,6 +537,7 @@
   // ---------- rendering ----------
   const perf = window.__perf = { pixels: 0, total: 0 };   // last frame's timings (ms)
   function draw() {
+    if (isPilot()) { drawPilot(); return; }
     const s = state.size;
     const r = discRadius();
     const [cx, cy] = projection.translate();
@@ -504,6 +597,59 @@
     if (state.menuOpen) drawMenu();
   }
 
+  // Pilot view: what you'd see from the object looking prograde. Ray-cast Earth below the
+  // horizon, space and limb glow above; whole round screen, no globe frame.
+  function drawPilot() {
+    const s = state.size, c = s / 2;
+    updateCamera();
+    ctx.clearRect(0, 0, s, s);
+    ctx.fillStyle = '#04060e';
+    ctx.fillRect(0, 0, s, s);
+    ctx.save();
+    ctx.beginPath(); ctx.arc(c, c, c, 0, 2 * Math.PI); ctx.clip();
+    if (state.cam) {
+      const tp = performance.now();
+      ctx.drawImage(renderGlobePixels(ui.night.checked), 0, 0);
+      perf.pixels = performance.now() - tp;
+      drawBehindEarth();
+    }
+    const rim = ctx.createRadialGradient(c, c, c * 0.75, c, c, c);
+    rim.addColorStop(0, 'rgba(0,0,0,0)');
+    rim.addColorStop(1, 'rgba(0,0,0,.45)');
+    ctx.fillStyle = rim;
+    ctx.fillRect(0, 0, s, s);
+    ctx.restore();
+    if (state.cam) {
+      drawHome();
+      drawTrack();
+      drawProgradeMarker();
+    }
+    drawHud();
+    if (state.menuOpen) drawMenu();
+  }
+
+  // Prograde symbol (as on a flight director): circle with three stubs, at the
+  // prograde direction (screen centre unless the user is looking around).
+  function drawProgradeMarker() {
+    const s = state.size, cam = state.cam, v = state.now.v;
+    const f = vnorm([v.x, v.y, v.z]), z = vdot(f, cam.f);
+    if (z <= 0.05) return;
+    const k = (s / 2) / Math.tan(PILOT_HALF_FOV);
+    const x = s / 2 + k * vdot(f, cam.rt) / z, y = s / 2 - k * vdot(f, cam.u) / z;
+    const r = s / 48;
+    const shape = () => {
+      ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI);
+      ctx.moveTo(x - r, y); ctx.lineTo(x - r * 2, y);
+      ctx.moveTo(x + r, y); ctx.lineTo(x + r * 2, y);
+      ctx.moveTo(x, y - r); ctx.lineTo(x, y - r * 1.8);
+    };
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = s / 160; shape(); ctx.stroke();
+    ctx.strokeStyle = '#ffd23f'; ctx.lineWidth = s / 300; shape(); ctx.stroke();
+    ctx.restore();
+  }
+
   // Soviet-instrument style lighting: lit from upper left, dark limb, glass glint.
   function drawGlobeShading(cx, cy, r) {
     const lx = cx - r * 0.35, ly = cy - r * 0.4;
@@ -537,7 +683,7 @@
   // Home location marker: blue dot with white rim, like an ownship symbol on a chart.
   function drawHome() {
     const p = project3d(HOME.lon, HOME.lat, 0);
-    if (!p.front) return;
+    if (!p.front || !p.inView) return;
     const s = state.size, rr = s / 150;
     ctx.save();
     ctx.fillStyle = '#1e7bff';
@@ -598,7 +744,7 @@
       const past = b.t <= 0;
       const fade = 1 - 0.65 * (Math.abs(b.t) / TRACK_SPAN_S);
       // Behind the Earth: not drawn here; drawBehindEarth() prints it grey on the surface.
-      if (a.hidden || b.hidden) continue;
+      if (a.hidden || b.hidden || !a.inView || !b.inView) continue;
       ctx.globalAlpha = fade;
       ctx.strokeStyle = past ? C.trackPast : C.trackFuture;
       ctx.lineWidth = past ? s / 300 : s / 200;
@@ -622,7 +768,7 @@
     for (const p of state.track) {
       const g = geoOf(p.r, frameGmst(p));
       const cur = { t: p.t, ...project3d(g.lon, g.lat, g.alt) };
-      if (prev && (prev.hidden || cur.hidden)) {
+      if (prev && (prev.hidden || cur.hidden) && prev.inView && cur.inView) {
         ctx.globalAlpha = 1 - 0.6 * Math.abs(cur.t) / TRACK_SPAN_S;
         ctx.lineWidth = cur.t <= 0 ? s / 340 : s / 260;
         ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(cur.x, cur.y); ctx.stroke();
@@ -649,7 +795,7 @@
 
     if (state.now) {
       const g = geoOf(state.now.r, state.now.gmst), a = project3d(g.lon, g.lat, g.alt);
-      if (a.hidden) {
+      if (a.hidden && a.inView) {
         // Hollow ring, same stroke width as the (future) grey track line.
         ctx.globalAlpha = 1;
         ctx.strokeStyle = C.behind;
@@ -1016,7 +1162,21 @@
     { mode: 'orbit', label: 'Orbit view', icon: 'orbit' },
     { mode: 'home', label: 'Ground view', icon: 'pin' },
     { mode: 'flat', label: 'Flat earth', icon: 'flat' },
+    { mode: 'pilot', label: 'Pilot view', icon: 'pilot' },
   ];
+
+  // Pilot-view icon: prograde symbol.
+  ICONS.pilot = (x, y, h) => {
+    const r = h * 0.24;
+    ctx.save();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = Math.max(1.2, h * 0.09); ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI);
+    ctx.moveTo(x - r, y); ctx.lineTo(x - r * 2, y);
+    ctx.moveTo(x + r, y); ctx.lineTo(x + r * 2, y);
+    ctx.moveTo(x, y - r); ctx.lineTo(x, y - r * 1.8);
+    ctx.stroke();
+    ctx.restore();
+  };
 
   // Flat-map icon: disc with polar-grid rings and meridians.
   ICONS.flat = (x, y, h) => {
@@ -1138,12 +1298,15 @@
   }
 
   function setMode(mode) {
-    const wasFlat = isFlat();
+    const wasKind = viewKind(state.mode);
     state.mode = mode;
     state.manualUntil = 0;
     projection = isFlat() ? azeq : ortho;
     path.projection(projection);
-    if (wasFlat !== isFlat()) state.rotate = targetRotation() || [0, -90, 0];   // no glide across projections
+    if (wasKind !== viewKind(mode)) {   // no glide across different kinds of view
+      if (isPilot()) state.rotate = [0, 0, 0];
+      else state.rotate = targetRotation() || (isFlat() ? [0, -90, 0] : state.rotate);
+    }
     for (const b of ui.modes) b.classList.toggle('active', b.dataset.mode === mode);
     state.dirty = true;
   }

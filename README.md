@@ -39,10 +39,23 @@ display size.
   (r / R)·180°, lon = atan2(x, −y) − λ. Ground-relative track drawn on the
   ground (nothing hidden), 5-min ticks, horizon circle; no sphere lighting
   (rim vignette + glint only), no reticle. Dragging only spins around the pole.
+- `pilot` ("Pilot view") — perspective view from the object looking prograde
+  (camera at the ECI position, forward = inertial velocity, up = radial out;
+  `updateCamera()`), 55° from centre to screen edge, filling the whole round
+  screen. Per pixel: ray–sphere intersection with the Earth (R = 6371 km) →
+  ECI hit point → Earth-fixed via GMST → same terrain/coast/night shading,
+  plus a 10° graticule sized to the pixel footprint and aerial haze toward the
+  horizon (∝ (t / t_horizon)⁵). Rays that miss: dark space with a thin limb
+  glow exp(−h_min / 90 km), lit on the day side. Horizon dips acos(R/(R+h))
+  (~23° at 550 km) below prograde. Track in the inertial frame via perspective
+  projection (`projectPilot()`): visible part red (prograde → horizon), hidden
+  part grey on the surface; Munich marker if in view; yellow prograde symbol
+  at the velocity direction. No stage model, footprint or globe shading.
+  Dragging looks around (yaw/pitch); tapping the time resets to prograde.
 - Dragging pans temporarily; the view glides back after 4 s.
 - On-screen menu (`drawMenu()`, `onTap()`): a tap (pointer moved < 6 px) on the
   bottom HUD tab opens a centred "VIEW" panel with
-  ORBIT VIEW / GROUND VIEW / FLAT EARTH (icon + upper-case label, active row highlighted with a white
+  ORBIT VIEW / GROUND VIEW / FLAT EARTH / PILOT VIEW (icon + upper-case label, active row highlighted with a white
   bar). Tapping an option switches mode and closes; tapping outside closes.
   `home` mode is labelled "Ground view" in the UI.
 - Tapping the top HUD tab (time) resets the view: drops any manual pan and
