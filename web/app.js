@@ -527,15 +527,20 @@
   function updateCamera() {
     if (!state.now) { state.cam = null; return; }
     const c = state.now.r, v = state.now.v;
-    let f = vnorm([v.x, v.y, v.z]);
-    let u = vnorm(c.map((x, i) => x - vdot(c, f) * f[i]));
-    let rt = vcross(f, u);
+    // Base frame: up = radial, forward = horizontal part of the velocity (prograde).
+    const up = vnorm(c);
+    const vv = [v.x, v.y, v.z], vu = vdot(vv, up);
+    let f = vnorm(vv.map((x, i) => x - vu * up[i]));
+    let rt = vcross(f, up);
+    // Look-around: yaw about the local vertical, then pitch about the (horizontal) right
+    // axis. The camera never rolls, and `hf` stays a well-defined horizontal heading even
+    // when looking straight down or up.
     const yaw = -state.rotate[0] / DEG, pitch = -state.rotate[1] / DEG;
-    const f1 = f.map((x, i) => x * Math.cos(yaw) + rt[i] * Math.sin(yaw));
+    const hf = f.map((x, i) => x * Math.cos(yaw) + rt[i] * Math.sin(yaw));
     rt = rt.map((x, i) => x * Math.cos(yaw) - f[i] * Math.sin(yaw));
-    f = f1.map((x, i) => x * Math.cos(pitch) + u[i] * Math.sin(pitch));
-    u = u.map((x, i) => x * Math.cos(pitch) - f1[i] * Math.sin(pitch));
-    state.cam = { c, f, u, rt, gmst: state.now.gmst };
+    f = hf.map((x, i) => x * Math.cos(pitch) + up[i] * Math.sin(pitch));
+    const u = up.map((x, i) => x * Math.cos(pitch) - hf[i] * Math.sin(pitch));
+    state.cam = { c, f, u, rt, up, hf, gmst: state.now.gmst };
   }
 
   // Perspective projection from the pilot camera. Lon/lat are in the frame of the camera's
@@ -686,7 +691,7 @@
     ctx.restore();
     if (state.cam) {
       drawHome();
-      drawTrack();
+      drawPilotTrack();
       drawPilotHud();
     }
     drawHud();
@@ -696,12 +701,18 @@
   // Prograde symbol (as on a flight director): circle with three stubs, at the
   // prograde direction (screen centre unless the user is looking around).
   function drawProgradeMarker() {
-    const s = state.size, cam = state.cam, v = state.now.v;
-    const f = vnorm([v.x, v.y, v.z]), z = vdot(f, cam.f);
-    if (z <= 0.05) return;
-    const k = (s / 2) / Math.tan(PILOT_HALF_FOV);
-    const x = s / 2 + k * vdot(f, cam.rt) / z, y = s / 2 - k * vdot(f, cam.u) / z;
-    const r = s / 48;
+    const s = state.size, c = s / 2, cam = state.cam, v = state.now.v;
+    const f = vnorm([v.x, v.y, v.z]);
+    const vx = vdot(f, cam.rt), vy = vdot(f, cam.u), vz = vdot(f, cam.f);
+    const k = c / Math.tan(PILOT_HALF_FOV), R = s * 0.2, r = s / 48;   // R: clear of the heading tape and the side boxes
+    let x, y, clamped = false;
+    if (vz > 0.05) { x = c + k * vx / vz; y = c - k * vy / vz; }
+    if (vz <= 0.05 || Math.hypot(x - c, y - c) > R) {
+      // Off the HUD: pin the marker to the HUD edge in the direction of travel.
+      let dx = vx, dy = -vy; const n = Math.hypot(dx, dy);
+      if (n < 1e-6) { dx = 0; dy = 1; } else { dx /= n; dy /= n; }
+      x = c + dx * R; y = c + dy * R; clamped = true;
+    }
     const shape = () => {
       ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI);
       ctx.moveTo(x - r, y); ctx.lineTo(x - r * 2, y);
@@ -710,8 +721,71 @@
     };
     ctx.save();
     ctx.lineCap = 'round';
+    ctx.setLineDash(clamped ? [s / 120, s / 160] : []);
     ctx.strokeStyle = C.hudShadow; ctx.lineWidth = s / 160; shape(); ctx.stroke();
     ctx.strokeStyle = C.hud; ctx.lineWidth = s / 300; shape(); ctx.stroke();
+    ctx.setLineDash([]);
+    if (clamped) {
+      // Arrow pointing on toward the travel direction + angle between view and travel.
+      const dx = (x - c) / R, dy = (y - c) / R, ax = x + dx * r * 2.6, ay = y + dy * r * 2.6, a = r * 0.8;
+      ctx.fillStyle = C.hud; ctx.shadowColor = C.hudShadow; ctx.shadowBlur = s / 160;
+      ctx.beginPath();
+      ctx.moveTo(ax + dx * a, ay + dy * a);
+      ctx.lineTo(ax - dx * a - dy * a, ay - dy * a + dx * a);
+      ctx.lineTo(ax - dx * a + dy * a, ay - dy * a - dx * a);
+      ctx.closePath(); ctx.fill();
+      ctx.font = `600 ${Math.round(s * 0.026)}px ${HUD_FONT}`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      const off = Math.round(Math.acos(Math.max(-1, Math.min(1, vz))) * DEG);
+      ctx.fillText(`${off}°`, x - dx * r * 2.8, y - dy * r * 2.8);
+    }
+    ctx.restore();
+  }
+
+  // Pilot-view orbit line: track segments split into short pieces, each clipped against a
+  // near plane in front of the camera (the orbit runs through the camera itself) and
+  // dropped where the Earth blocks the line of sight. Only what is really visible is drawn.
+  const PILOT_NEAR_KM = 5, PILOT_SUBDIV = 6;
+  function drawPilotTrack() {
+    const tr = state.track, cam = state.cam, s = state.size, c = s / 2;
+    if (tr.length < 2) return;
+    const k = c / Math.tan(PILOT_HALF_FOV), RE2 = EARTH_R_KM ** 2, cc = vdot(cam.c, cam.c);
+    const toCam = (P) => {
+      const rel = [P[0] - cam.c[0], P[1] - cam.c[1], P[2] - cam.c[2]];
+      return { x: vdot(rel, cam.rt), y: vdot(rel, cam.u), z: vdot(rel, cam.f), rel };
+    };
+    const visible = (q) => {   // line of sight from the camera reaches q before the Earth?
+      const dist = Math.hypot(...q.rel), b = vdot(cam.c, q.rel) / dist, disc = b * b - (cc - RE2);
+      const t1 = disc >= 0 ? -b - Math.sqrt(disc) : -1;
+      return !(t1 > 0 && t1 < dist - 1e-3);
+    };
+    const scr = (q) => [c + k * q.x / q.z, c - k * q.y / q.z];
+    // Point on the arc between two orbit positions (radius interpolated, direction slerp-ish).
+    const along = (a, b, t) => {
+      const p = a.map((x, i) => x + (b[i] - x) * t), n = Math.hypot(...p);
+      const rr = Math.hypot(...a) * (1 - t) + Math.hypot(...b) * t;
+      return p.map((x) => x / n * rr);
+    };
+    ctx.save();
+    ctx.lineCap = 'round';
+    for (let i = 1; i < tr.length; i++) {
+      const A = tr[i - 1], B = tr[i];
+      for (let j = 0; j < PILOT_SUBDIV; j++) {
+        let p = toCam(along(A.r, B.r, j / PILOT_SUBDIV)), q = toCam(along(A.r, B.r, (j + 1) / PILOT_SUBDIV));
+        if (p.z < PILOT_NEAR_KM && q.z < PILOT_NEAR_KM) continue;
+        if (!visible(p) || !visible(q)) continue;
+        if (p.z < PILOT_NEAR_KM || q.z < PILOT_NEAR_KM) {   // clip to the near plane
+          const t = (PILOT_NEAR_KM - p.z) / (q.z - p.z), m = { x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t, z: PILOT_NEAR_KM };
+          if (p.z < PILOT_NEAR_KM) p = m; else q = m;
+        }
+        const t = A.t + (B.t - A.t) * (j + 1) / PILOT_SUBDIV;
+        ctx.globalAlpha = 1 - 0.65 * Math.abs(t) / TRACK_SPAN_S;
+        ctx.strokeStyle = t <= 0 ? C.trackPast : C.trackFuture;
+        ctx.lineWidth = t <= 0 ? s / 300 : s / 200;
+        const [x1, y1] = scr(p), [x2, y2] = scr(q);
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+      }
+    }
     ctx.restore();
   }
 
@@ -727,13 +801,14 @@
   // horizontal), heading tape, boresight, speed and altitude boxes, prograde marker.
   function drawPilotHud() {
     const s = state.size, c = s / 2, cam = state.cam;
-    const up = vnorm(cam.c);                                         // local vertical
+    const up = cam.up, hf = cam.hf;                                  // local vertical, look heading
     const north = vnorm([-up[2] * up[0], -up[2] * up[1], 1 - up[2] * up[2]]);   // ECI z on the horizontal plane
     const east = vcross(north, up);
-    // Camera forward split into horizontal heading + pitch.
-    const fu = vdot(cam.f, up);
-    const hf = vnorm(cam.f.map((x, i) => x - fu * up[i]));
-    const heading = ((Math.atan2(vdot(hf, east), vdot(hf, north)) * DEG) + 360) % 360;
+    const rightH = vcross(hf, up);                                   // horizontal, to the right
+    const hdgOf = (d) => ((Math.atan2(vdot(d, east), vdot(d, north)) * DEG) + 360) % 360;
+    const heading = hdgOf(hf);
+    const v = state.now.v, vel = vnorm([v.x, v.y, v.z]);
+    const track = hdgOf(vnorm(vel.map((x, i) => x - vdot(vel, up) * up[i])));   // direction of travel
 
     const lw = Math.max(1.2, s / 360), fs = Math.round(s * 0.03);
     ctx.save();
@@ -748,19 +823,26 @@
     ctx.beginPath(); ctx.arc(c, c, s * 0.34, 0, 2 * Math.PI); ctx.clip();
     for (let p = -80; p <= 80; p += 10) {
       const pr = p / DEG;
-      const pt = projectDir(hf.map((x, i) => x * Math.cos(pr) + up[i] * Math.sin(pr)));
+      const d = hf.map((x, i) => x * Math.cos(pr) + up[i] * Math.sin(pr));
+      const pt = projectDir(d);
       if (!pt) continue;
+      // Bar orientation = the local horizontal (rightH) as seen at that point.
+      const q = projectDir(vnorm(d.map((x, i) => x + rightH[i] * 0.01)));
+      const ang = q ? Math.atan2(q.y - pt.y, q.x - pt.x) : 0;
       const half = p === 0 ? s * 0.2 : s * 0.09, gap = s * 0.045, tick = s * 0.018 * (p > 0 ? 1 : -1);
+      ctx.save();
+      ctx.translate(pt.x, pt.y); ctx.rotate(ang);
       ctx.setLineDash(p < 0 ? [s / 70, s / 110] : []);
       ctx.beginPath();
-      ctx.moveTo(pt.x - half, pt.y + (p ? tick : 0)); ctx.lineTo(pt.x - half, pt.y); ctx.lineTo(pt.x - gap, pt.y);
-      ctx.moveTo(pt.x + gap, pt.y); ctx.lineTo(pt.x + half, pt.y); ctx.lineTo(pt.x + half, pt.y + (p ? tick : 0));
+      ctx.moveTo(-half, p ? tick : 0); ctx.lineTo(-half, 0); ctx.lineTo(-gap, 0);
+      ctx.moveTo(gap, 0); ctx.lineTo(half, 0); ctx.lineTo(half, p ? tick : 0);
       ctx.stroke();
       ctx.setLineDash([]);
       if (p) {
-        ctx.textAlign = 'right'; ctx.fillText(String(Math.abs(p)), pt.x - half - s * 0.01, pt.y);
-        ctx.textAlign = 'left'; ctx.fillText(String(Math.abs(p)), pt.x + half + s * 0.01, pt.y);
+        ctx.textAlign = 'right'; ctx.fillText(String(Math.abs(p)), -half - s * 0.01, 0);
+        ctx.textAlign = 'left'; ctx.fillText(String(Math.abs(p)), half + s * 0.01, 0);
       }
+      ctx.restore();
     }
     ctx.restore();
 
@@ -783,6 +865,20 @@
         ctx.fillText(lbl, x, ty - s * 0.032);
       }
     }
+    // Track bug: direction of travel on the tape (hollow diamond), or an arrow at the tape
+    // end pointing toward it when it is off the tape.
+    const toTrack = ((track - heading + 540) % 360) - 180, by = ty - s * 0.05, bs = s * 0.011;
+    if (Math.abs(toTrack) <= span) {
+      const bx = c + toTrack * pxDeg;
+      ctx.beginPath();
+      ctx.moveTo(bx, by - bs); ctx.lineTo(bx + bs, by); ctx.lineTo(bx, by + bs); ctx.lineTo(bx - bs, by); ctx.closePath();
+      ctx.stroke();
+    } else {
+      const side = Math.sign(toTrack), ax = c + side * (span * pxDeg + s * 0.02);
+      ctx.beginPath();
+      ctx.moveTo(ax - side * bs, by - bs); ctx.lineTo(ax + side * bs, by); ctx.lineTo(ax - side * bs, by + bs); ctx.closePath();
+      ctx.fill();
+    }
     ctx.beginPath();   // caret + current heading box
     ctx.moveTo(c - s * 0.012, ty + s * 0.022); ctx.lineTo(c, ty + s * 0.006); ctx.lineTo(c + s * 0.012, ty + s * 0.022);
     ctx.stroke();
@@ -790,7 +886,7 @@
 
     // Speed (left) and altitude (right) boxes.
     const g = geoOf(state.now.r, state.now.gmst);
-    const v = state.now.v, spd = Math.hypot(v.x, v.y, v.z);
+    const spd = Math.hypot(v.x, v.y, v.z);
     hudBox(spd.toFixed(2), s * 0.11, c, 'left', fs, 'KM/S');
     hudBox(g.alt.toFixed(0), s * 0.89, c, 'right', fs, 'KM');
     ctx.restore();

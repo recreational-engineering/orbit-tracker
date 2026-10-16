@@ -48,8 +48,10 @@ display size.
   horizon (∝ (t / t_horizon)⁵). Rays that miss: dark space with a thin limb
   glow exp(−h_min / 90 km), lit on the day side. Horizon dips acos(R/(R+h))
   (~23° at 550 km) below prograde. Track in the inertial frame via perspective
-  projection (`projectPilot()`): only the visible part, red (prograde →
-  horizon); the part behind the Earth is not drawn. Munich marker if in view.
+  projection (`drawPilotTrack()`): each 30 s segment split into 6 pieces along
+  the arc, clipped against a 5 km near plane (the orbit runs through the
+  camera) and dropped where the Earth blocks the line of sight; only what is
+  really visible is drawn. Munich marker if in view.
   No stage model, footprint or globe shading.
   Fighter-style HUD (`drawPilotHud()`), green #4dff7a with a dark shadow,
   fixed to the screen so it stays put while looking around:
@@ -60,7 +62,17 @@ display size.
     ticks every 5°, labels every 30° with N/E/S/W), caret + 3-digit box;
   - fixed boresight "W" at the screen centre;
   - speed box (km/s) left, altitude box (km) right, at centre height;
-  - prograde marker (circle + 3 stubs) at the inertial velocity direction.
+  - prograde marker (circle + 3 stubs) at the inertial velocity direction;
+    when it is outside 0.2·s of the centre (or behind you) it is parked on
+    that circle in its direction, dashed, with an arrow pointing on toward it
+    and the angle between view and travel direction;
+  - track bug: hollow diamond on the heading tape at the direction of travel,
+    or a filled arrow at the tape end when it is off the tape.
+  Camera frame (`updateCamera()`): up = radial, base forward = horizontal part
+  of the velocity, look-around = yaw about the vertical then pitch about the
+  horizontal right axis, never roll; the HUD uses the stored horizontal look
+  heading, and each ladder bar is drawn along the projected local horizontal,
+  so nothing tilts or flips when looking straight down.
   Dragging looks around (yaw/pitch); tapping the time resets to prograde.
   High-res terrain (pilot view only, see `HI` / `requestHiTile()` in `app.js`):
   - full HYP_50M_SR (10800×5400, ~3.7 km/texel) as 15×30 JPEG tiles of
