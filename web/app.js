@@ -1245,10 +1245,31 @@
     return iw + vw + uw;
   }
 
+  // Widest digit of the HUD font at this size, so value slots fit any number.
+  const widestDigitCache = new Map();
+  function widestDigit(fs) {
+    if (!widestDigitCache.has(fs) || !document.fonts.check(`600 ${fs}px "Barlow Condensed"`)) {
+      ctx.save();
+      ctx.font = `600 ${fs}px ${HUD_FONT}`;
+      let best = '0', bw = 0;
+      for (const d of '0123456789') { const w = ctx.measureText(d).width; if (w > bw) { bw = w; best = d; } }
+      ctx.restore();
+      widestDigitCache.set(fs, best);
+    }
+    return widestDigitCache.get(fs);
+  }
+
   // A centred row of readouts separated by thin vertical rules. Returns the row width.
-  function readoutRow(items, y, fs, draw = true) {
-    const sep = fs * 0.9;
-    const widths = items.map((it) => readout(0, 0, it, fs, false));
+  // `slots`: worst-case items ('#' = any digit); each readout gets a fixed slot at least
+  // that wide, left-aligned, so the row never changes width while values change.
+  function readoutRow(items, y, fs, draw = true, slots = null) {
+    const sep = fs * 0.9, wd = widestDigit(fs);
+    const widths = items.map((it, i) => {
+      const w = readout(0, 0, it, fs, false);
+      if (!slots) return w;
+      const t = slots[i];
+      return Math.max(w, readout(0, 0, { ...t, value: t.value.replace(/#/g, wd) }, fs, false));
+    });
     const total = widths.reduce((a, b) => a + b, 0) + sep * (items.length - 1);
     if (!draw) return total;
     let x = state.size / 2 - total / 2;
@@ -1297,10 +1318,11 @@
     // Top tab: UTC time.
     const timeRow = [{ value: simTime().toISOString().slice(11, 19), unit: 'UTC' }];
     const tfs = Math.round(s * 0.034);
-    const tHalf = readoutRow(timeRow, 0, tfs, false) / 2 + pad;
+    const timeSlots = [{ value: '##:##:##', unit: 'UTC' }];
+    const tHalf = readoutRow(timeRow, 0, tfs, false, timeSlots) / 2 + pad;
     edgeBand(s * 0.068, tHalf, true);
     state.topTab = { yCut: s * 0.068, halfWidth: tHalf };
-    readoutRow(timeRow, s * 0.038, tfs);
+    readoutRow(timeRow, s * 0.038, tfs, true, timeSlots);
 
     // Bottom tab: primary row (distance to Munich, next pass), secondary row (position, altitude).
     if (state.sat && state.now) {
@@ -1314,13 +1336,27 @@
         { value: Math.abs(lon).toFixed(1) + '°', unit: lon >= 0 ? 'E' : 'W' },
         { icon: 'alt', value: alt.toFixed(0), unit: 'km' },
       ];
+      // Worst cases: 5-digit km (up to 99 999 km), HH:MM, 88.8°N/S, 188.8°E/W ('W' widest).
+      const primarySlots = [
+        { icon: 'dist', value: '#####', unit: 'km' },
+        { icon: 'pass', value: '##:##' },
+      ];
+      const secondarySlots = [
+        { value: '##.#°', unit: 'W' },
+        { value: '###.#°', unit: 'W' },
+        { icon: 'alt', value: '#####', unit: 'km' },
+      ];
       const pfs = Math.round(s * 0.038), sfs = Math.round(s * 0.028);
-      // The flat edge only has to fit the first row; the flanks widen toward the second.
-      const half = readoutRow(primary, 0, pfs, false) / 2 + pad;
-      edgeBand(s * 0.88, half, false);
-      state.bottomTab = { yCut: s * 0.88, halfWidth: half };
-      readoutRow(primary, s * 0.912, pfs);
-      readoutRow(secondary, s * 0.957, sfs);
+      const yCut = s * 0.88, y1 = s * 0.912, y2 = s * 0.957;
+      // Fixed tab width: fits the first row at the flat edge and the second row between
+      // the flanks, which have widened by (y2 − yCut) / tan(angle) at its height.
+      const w1 = readoutRow(primary, 0, pfs, false, primarySlots);
+      const w2 = readoutRow(secondary, 0, sfs, false, secondarySlots);
+      const half = Math.max(w1 / 2 + pad, w2 / 2 + pad * 0.6 - (y2 - yCut) / Math.tan(BAND_ANGLE));
+      edgeBand(yCut, half, false);
+      state.bottomTab = { yCut, halfWidth: half };
+      readoutRow(primary, y1, pfs, true, primarySlots);
+      readoutRow(secondary, y2, sfs, true, secondarySlots);
     }
     ctx.restore();
   }

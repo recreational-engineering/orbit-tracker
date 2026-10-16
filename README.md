@@ -138,6 +138,10 @@ display size.
      local time of the next range minimum (20 s scan up to 4 h, ternary
      refinement to 1 s, `findNextPass()`); secondary row (0.028·s) =
      latitude | longitude | altitude icon + altitude.
+   Fixed widths: every readout has a slot sized for its worst-case value
+   ('#' = widest digit of the font: 5-digit km, HH:MM, ##.#° + W, ###.#° + W,
+   ##:##:## UTC), left-aligned, and the tabs are sized from those slots, so
+   nothing changes width while values change (`readoutRow(…, slots)`).
    Items in a row are separated by thin vertical rules (`readoutRow()`).
 
 Side-panel controls (time offset, altitude exaggeration, layer toggles,
