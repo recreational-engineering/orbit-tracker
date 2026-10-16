@@ -139,11 +139,16 @@ display size.
    the glass shading), so the globe stays opaque. A hidden object is a hollow grey
    ring (radius s/55, stroke = track width s/260) at its projected position (no stage model); in ground view hidden 5-min
    ticks are grey.
-7b. 5-minute travel-time marks at absolute times (`state.marks`, ground point at
-   that moment). Munich view: short screen-space ticks across the track
-   (`drawMarkTicks()`). Orbit view: no ticks; instead ±60° great-circle lines
-   perpendicular to the ground track, printed on the globe under the glass
-   shading, turning with the Earth (`drawMarkMesh()`).
+7b. Travel-time ticks (`drawMarkTicks()`, `drawTick()`): one per minute, at
+   absolute minutes (`state.marks`, `MARK_STEP_S = 60`), pinned to the ground
+   point the object passes at that minute (Earth-fixed), so the object visibly
+   moves past them in every view; in orbit view they ride along with the
+   turning Earth (along the ground track, drifting off the inertial orbit
+   line). Fine 1-px ruler ticks across the ground-relative direction of
+   motion: half length s/170, every 5th minute s/95 and slightly heavier;
+   muted rgba(255,150,150,.8), fading with |Δt|. Ground view also draws
+   hidden ticks in grey on the grey line; orbit view shows visible ticks only.
+   Not shown in pilot view.
 8. Object: simplified upper stage (nozzle, aft dome, white tank, blue ring,
    payload adapter, gold payload) from lit frustums, nose along the projected
    3D flight direction; not drawn when obstructed (`drawStage()`).
