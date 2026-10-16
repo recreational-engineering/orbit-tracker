@@ -1102,9 +1102,9 @@
   // Elevation rings around the sub-satellite point, like the dashed range rings of an
   // aircraft nav display: from inside each ring the object stands at least ε above the
   // horizon. Ground radius for elevation ε: acos(R·cos ε / (R + h)) − ε. Outermost = 0°
-  // (the object's horizon, solid); the inner ones dashed. Printed on the surface, under
+  // (the object's horizon, solid, with a compass rose); the inner ones dashed. Printed on the surface, under
   // the orbit line.
-  const ELEV_RINGS = [0, 15, 30];
+  const ELEV_RINGS = [0, 10, 20];
   function drawFootprint() {
     if (!state.now) return;
     const g = geoOf(state.now.r, state.now.gmst);
@@ -1114,6 +1114,7 @@
     ctx.lineWidth = s / 200;   // same as the orbit line
     const fs = Math.round(s * 0.024), apex = project3d(g.lon, g.lat, g.alt);
     const labels = [];
+    let horizonDeg = 0;
     for (const e of ELEV_RINGS) {
       const er = e / DEG, radius = (Math.acos(k * Math.cos(er)) - er) * DEG;
       const ring = d3.geoCircle().center([g.lon, g.lat]).radius(radius).precision(2)();
@@ -1125,9 +1126,31 @@
         const q = project3d(lo, la, 0);
         if (q.front && q.inView && (!best || q.y - q.x > best.y - best.x)) best = q;
       }
-      if (best) labels.push({ text: `${e}°`, x: best.x, y: best.y });
+      if (best && e > 0) labels.push({ text: `${e}°`, x: best.x, y: best.y });
+      if (e === 0) horizonDeg = radius;
     }
     ctx.setLineDash([]);
+
+    // Compass rose on the horizon ring (Earth frame, azimuth from the sub-satellite point):
+    // inward ticks every 10°, longer every 30°, N / E / S / W just inside.
+    const pxDeg = (isFlat() ? 180 : DEG) / discRadius();          // ground degrees per screen px at the centre
+    ctx.lineWidth = Math.max(1, s / 360);
+    ctx.beginPath();
+    for (let az = 0; az < 360; az += 10) {
+      const major = az % 30 === 0, len = (major ? s / 55 : s / 95) * pxDeg;
+      const [lo1, la1] = destination(g.lon, g.lat, az, horizonDeg);
+      const [lo2, la2] = destination(g.lon, g.lat, az, horizonDeg - len);
+      const a = project3d(lo1, la1, 0), b = project3d(lo2, la2, 0);
+      if (!a.front || !a.inView || !b.front) continue;
+      ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+    }
+    ctx.stroke();
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+    for (const [az, txt] of [[0, 'N'], [90, 'E'], [180, 'S'], [270, 'W']]) {
+      const [lo, la] = destination(g.lon, g.lat, az, horizonDeg - (s / 55 + fs * 0.9) * pxDeg);
+      const q = project3d(lo, la, 0);
+      if (q.front && q.inView) hudText(txt, q.x, q.y, fs, 600, true, C.footprint);
+    }
     ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
     const placed = [], w = fs * 1.4, h = fs * 1.1;
     for (const L of labels) {

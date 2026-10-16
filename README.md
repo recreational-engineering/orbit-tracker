@@ -127,11 +127,13 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
 4. Dashed country borders (110m), faint white 10° graticule (vector).
 4b. Elevation rings (`drawFootprint()`, all views but pilot), like a nav display's
    range rings around the sub-satellite point: 0° (the object's horizon,
-   outermost, solid), 15° and 30° elevation (dashed s/55 : s/80); ground radius
+   outermost, solid), 10° and 20° elevation (dashed s/55 : s/80); ground radius
    acos(R·cos ε / (R + h)) − ε. Amber/yellow #ffc800, width s/200. Small yellow
-   labels with a dark outline at each ring's lower-left visible point, skipped
-   if they would overlap another label or the object. Printed on the surface,
-   under the orbit line.
+   "10°" / "20°" labels with a dark outline at each inner ring's lower-left
+   visible point, skipped if they would overlap another label or the object.
+   Compass rose on the horizon ring, Earth frame (azimuth from the sub-satellite
+   point): inward ticks every 10° (s/95), every 30° longer (s/55), N/E/S/W
+   just inside the ring. Printed on the surface, under the orbit line.
 5. Sphere lighting (globe views; `sphereLayers()` / `drawGlobeShading()`),
    applied after everything printed on the globe: per disc pixel normal
    N = (x, y, √(1−x²−y²)), lamp L = norm(−0.5, 0.6, 0.62);
