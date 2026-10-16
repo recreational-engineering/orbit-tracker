@@ -145,16 +145,15 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
    (#c4c8cc) line printed on the visible surface (inside the globe clip, under
    the glass shading), so the globe stays opaque. A hidden object is a hollow grey
    ring (radius s/55, stroke = track width s/260) at its projected position (no stage model).
-7b. Travel-time ticks (`drawMarkTicks()`, `drawTick()`): one per minute, at
-   absolute minutes (`state.marks`, `MARK_STEP_S = 60`), pinned to the ground
-   point the object passes at that minute (Earth-fixed), so the object visibly
-   moves past them in every view; in orbit view they ride along with the
-   turning Earth (along the ground track, drifting off the inertial orbit
-   line). Fine 1-px ruler ticks across the ground-relative direction of
-   motion: half length s/170, every 5th minute s/95 and slightly heavier;
-   muted rgba(255,150,150,.8), fading with |Δt|. Ground view also draws
-   hidden ticks in grey on the grey line; orbit view shows visible ticks only.
-   Not shown in pilot view.
+7b. Travel-time ticks (`drawMarkTicks()`, `drawTick()`, `markPoints()`): one
+   per minute at absolute minutes (`state.marks`, `MARK_STEP_S = 60`, ECI
+   positions), placed in the same frame as the drawn orbit line, so they always
+   sit on it: ground-relative in earth spin / ground reference / flat earth,
+   inertial in satellite reference (there they slide down the vertical line and
+   pass under the fixed object once a minute). Fine 1-px ruler ticks across the
+   line: half length s/170, every 5th minute s/95 and slightly heavier; muted
+   rgba(255,150,150,.8), fading with |Δt|; hidden ticks grey on the grey line.
+   Not shown in pilot reference.
 8. Object: simplified upper stage (nozzle, aft dome, white tank, blue ring,
    payload adapter, gold payload) from lit frustums, nose along the projected
    3D flight direction; not drawn when obstructed (`drawStage()`).

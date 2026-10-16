@@ -460,7 +460,7 @@
     const step = MARK_STEP_S * 1000, t0 = now.getTime();
     for (let ms = Math.ceil((t0 - TRACK_SPAN_S * 1000) / step) * step; ms <= t0 + TRACK_SPAN_S * 1000; ms += step) {
       const a = propagateEci(new Date(ms)), b = propagateEci(new Date(ms + 10000));
-      if (a && b) marks.push({ t: (ms - t0) / 1000, major: Math.round(ms / step) % MARK_MAJOR === 0, ...geoOf(a.r, a.gmst), dir: geoOf(b.r, b.gmst) });
+      if (a && b) marks.push({ t: (ms - t0) / 1000, major: Math.round(ms / step) % MARK_MAJOR === 0, a, b });
     }
     state.marks = marks;
     state.nextPass = findNextPass(now);
@@ -1061,13 +1061,12 @@
       prev = cur;
     }
 
-    // Ground view only: there the grey ticks sit on the grey ground-relative line. In orbit
-    // view the grey line is the inertial orbit, which ground-pinned ticks drift away from.
+    // Hidden ticks in grey, on the grey line (same frame as the line, see markPoints()).
     ctx.lineCap = 'butt';
-    for (const m of state.mode === 'home' || state.mode === 'spin' ? state.marks : []) {
-      const a = project3d(m.lon, m.lat, m.alt);
+    for (const m of state.marks) {
+      const [a, b] = markPoints(m);
       if (!a.hidden) continue;
-      drawTick(a, project3d(m.dir.lon, m.dir.lat, m.dir.alt), m.major, C.tickBehind, 1 - 0.6 * Math.abs(m.t) / TRACK_SPAN_S);
+      drawTick(a, b, m.major, C.tickBehind, 1 - 0.6 * Math.abs(m.t) / TRACK_SPAN_S);
     }
     ctx.lineCap = 'round';
 
@@ -1127,13 +1126,21 @@
     ctx.beginPath(); ctx.moveTo(p.x - nx, p.y - ny); ctx.lineTo(p.x + nx, p.y + ny); ctx.stroke();
   }
 
+  // A mark's screen position and a point 10 s later (for the tick direction), in the same
+  // frame as the drawn orbit line (frameGmst): ground-relative in ground / spin / flat
+  // views, inertial in satellite reference — so the ticks always sit on the line.
+  function markPoints(m) {
+    const g = geoOf(m.a.r, frameGmst(m.a)), h = geoOf(m.b.r, frameGmst(m.b));
+    return [project3d(g.lon, g.lat, g.alt), project3d(h.lon, h.lat, h.alt)];
+  }
+
   function drawMarkTicks() {
     ctx.save();
     ctx.lineCap = 'butt';
     for (const m of state.marks) {
-      const p = project3d(m.lon, m.lat, m.alt);
+      const [p, q] = markPoints(m);
       if (p.hidden || !p.inView) continue;   // hidden ones: grey, from drawBehindEarth()
-      drawTick(p, project3d(m.dir.lon, m.dir.lat, m.dir.alt), m.major, C.tick, 1 - 0.6 * Math.abs(m.t) / TRACK_SPAN_S);
+      drawTick(p, q, m.major, C.tick, 1 - 0.6 * Math.abs(m.t) / TRACK_SPAN_S);
     }
     ctx.restore();
   }
