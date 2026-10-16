@@ -125,10 +125,13 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
      Night 2012, red channel) × n.
    No per-frame vector clipping: on desktop this pass is ~50–65 ms at 480².
 4. Dashed country borders (110m), faint white 10° graticule (vector).
-4b. Both views: the object's horizon on the ground — small circle around
-   the sub-satellite point with radius acos(R / (R + h)), aviation amber/yellow
-   #ffc800 at the orbit-line width s/200, printed on the surface under the
-   orbit line (`drawFootprint()`).
+4b. Elevation rings (`drawFootprint()`, all views but pilot), like a nav display's
+   range rings around the sub-satellite point: 0° (the object's horizon,
+   outermost, solid), 15° and 30° elevation (dashed s/55 : s/80); ground radius
+   acos(R·cos ε / (R + h)) − ε. Amber/yellow #ffc800, width s/200. Small yellow
+   labels with a dark outline at each ring's lower-left visible point, skipped
+   if they would overlap another label or the object. Printed on the surface,
+   under the orbit line.
 5. Sphere lighting (globe views; `sphereLayers()` / `drawGlobeShading()`),
    applied after everything printed on the globe: per disc pixel normal
    N = (x, y, √(1−x²−y²)), lamp L = norm(−0.5, 0.6, 0.62);

@@ -1099,15 +1099,44 @@
 
   // Both views: the object's horizon on the ground — every point that sees it at 0°
   // elevation lies on a small circle around the sub-satellite point, radius acos(R / (R + h)).
+  // Elevation rings around the sub-satellite point, like the dashed range rings of an
+  // aircraft nav display: from inside each ring the object stands at least ε above the
+  // horizon. Ground radius for elevation ε: acos(R·cos ε / (R + h)) − ε. Outermost = 0°
+  // (the object's horizon, solid); the inner ones dashed. Printed on the surface, under
+  // the orbit line.
+  const ELEV_RINGS = [0, 15, 30];
   function drawFootprint() {
     if (!state.now) return;
     const g = geoOf(state.now.r, state.now.gmst);
-    const radius = Math.acos(EARTH_R_KM / (EARTH_R_KM + g.alt)) * DEG;
-    const s = state.size;
+    const s = state.size, k = EARTH_R_KM / (EARTH_R_KM + g.alt);
     ctx.save();
-    ctx.strokeStyle = C.footprint;
-    ctx.lineWidth = s / 200;   // same as the orbit line; printed on the surface, under it
-    ctx.beginPath(); path(d3.geoCircle().center([g.lon, g.lat]).radius(radius).precision(2)()); ctx.stroke();
+    ctx.strokeStyle = C.footprint; ctx.fillStyle = C.footprint;
+    ctx.lineWidth = s / 200;   // same as the orbit line
+    const fs = Math.round(s * 0.024), apex = project3d(g.lon, g.lat, g.alt);
+    const labels = [];
+    for (const e of ELEV_RINGS) {
+      const er = e / DEG, radius = (Math.acos(k * Math.cos(er)) - er) * DEG;
+      const ring = d3.geoCircle().center([g.lon, g.lat]).radius(radius).precision(2)();
+      ctx.setLineDash(e === 0 ? [] : [s / 55, s / 80]);
+      ctx.beginPath(); path(ring); ctx.stroke();
+      // Label point: the ring's lower-left-most visible point (nav-display style).
+      let best = null;
+      for (const [lo, la] of ring.coordinates[0]) {
+        const q = project3d(lo, la, 0);
+        if (q.front && q.inView && (!best || q.y - q.x > best.y - best.x)) best = q;
+      }
+      if (best) labels.push({ text: `${e}°`, x: best.x, y: best.y });
+    }
+    ctx.setLineDash([]);
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+    const placed = [], w = fs * 1.4, h = fs * 1.1;
+    for (const L of labels) {
+      // Skip labels that would collide with another label or sit on the object.
+      if (placed.some((p) => Math.abs(p.x - L.x) < w && Math.abs(p.y - L.y) < h)) continue;
+      if (!apex.hidden && Math.hypot(apex.x - L.x, apex.y - L.y) < s * 0.06) continue;
+      hudText(L.text, L.x, L.y, fs, 600, true, C.footprint);
+      placed.push(L);
+    }
     ctx.restore();
   }
 
@@ -1263,7 +1292,7 @@
   }
 
   // Text, optionally with a thin dark outline so it stays legible over bright terrain.
-  function hudText(text, x, y, size, weight = 600, outline = true) {
+  function hudText(text, x, y, size, weight = 600, outline = true, color = '#ffffff') {
     ctx.font = `${weight} ${size}px ${HUD_FONT}`;
     if (outline) {
       ctx.lineJoin = 'round';
@@ -1271,7 +1300,7 @@
       ctx.strokeStyle = 'rgba(0,0,0,.7)';
       ctx.strokeText(text, x, y);
     }
-    ctx.fillStyle = '#ffffff';
+    ctx.fillStyle = color;
     ctx.fillText(text, x, y);
     return ctx.measureText(text).width;
   }
