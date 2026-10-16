@@ -1151,7 +1151,7 @@
 
     // Elevation labels first, so the rings can leave gaps for them.
     const labels = [];
-    for (const e of ELEV_RINGS.slice(1)) {
+    for (const e of ELEV_RINGS) {
       const [lo, la] = destination(g.lon, g.lat, ELEV_LABEL_AZ, ringDeg(e));
       const q = project3d(lo, la, 0);
       if (!q.front || !q.inView) continue;

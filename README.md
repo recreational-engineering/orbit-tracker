@@ -132,7 +132,7 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
      inner range rings at 10° and 20° elevation, max(0.8, s/600) px; ground
      radius acos(R·cos ε / (R + h)) − ε;
    - fine cross N–S / E–W through the centre, max(0.8, s/600) px;
-   - "10°" and "20°" (font 0.018·s) on the W arm where it crosses each inner
+   - "0°", "10°" and "20°" (font 0.018·s) on the W arm where it crosses each
      ring, in a gap cut into ring and arm (rings and arms are screen
      polylines that skip the label boxes);
    - outside the horizon ring: 1-px ticks every 10° (s/95), every 30° long
