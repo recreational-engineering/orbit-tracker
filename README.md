@@ -48,10 +48,37 @@ display size.
   horizon (∝ (t / t_horizon)⁵). Rays that miss: dark space with a thin limb
   glow exp(−h_min / 90 km), lit on the day side. Horizon dips acos(R/(R+h))
   (~23° at 550 km) below prograde. Track in the inertial frame via perspective
-  projection (`projectPilot()`): visible part red (prograde → horizon), hidden
-  part grey on the surface; Munich marker if in view; yellow prograde symbol
-  at the velocity direction. No stage model, footprint or globe shading.
+  projection (`projectPilot()`): only the visible part, red (prograde →
+  horizon); the part behind the Earth is not drawn. Munich marker if in view.
+  No stage model, footprint or globe shading.
+  Fighter-style HUD (`drawPilotHud()`), green #4dff7a with a dark shadow,
+  fixed to the screen so it stays put while looking around:
+  - pitch ladder conformal to the local horizontal (radial = up): horizon line
+    at 0°, solid bars above / dashed bars below every 10° with numbers,
+    clipped to a circle of 0.34·s (the visible Earth horizon sits at ≈ −23°);
+  - heading tape under the time tab (0° = north along the local meridian,
+    ticks every 5°, labels every 30° with N/E/S/W), caret + 3-digit box;
+  - fixed boresight "W" at the screen centre;
+  - speed box (km/s) left, altitude box (km) right, at centre height;
+  - prograde marker (circle + 3 stubs) at the inertial velocity direction.
   Dragging looks around (yaw/pitch); tapping the time resets to prograde.
+  High-res terrain (pilot view only, see `HI` / `requestHiTile()` in `app.js`):
+  - full HYP_50M_SR (10800×5400, ~3.7 km/texel) as 15×30 JPEG tiles of
+    360×360 px = 12°×12°, `web/tiles/hyp/<row>_<col>.jpg` (row 0 = 90°N…78°N,
+    col 0 = 180°W…168°W), ~9 MB total, ocean tiles ~4 KB;
+  - per pixel, a tile is used only where the ground footprint is fine enough
+    (hit distance × pixel angle < 12 km, i.e. the nearer ground); toward the
+    horizon the 2048-wide global texture is used, so typically only ~6–15
+    tiles are needed at once;
+  - tiles load on demand (max 3 in flight) into a fixed LRU cache of 24 tiles;
+    until a tile is there, the global texture is shown (no stalls);
+  - water = white texels, coastline = water/land edge inside the tile;
+  - cost: on desktop the tile lookup adds ~1 ms to the ~38 ms pilot frame;
+  - ESP port: bake the colour boost into the tiles offline, decode with the
+    P4 hardware JPEG decoder to RGB565 (360×360×2 B = 253 KB per tile, 24 tiles
+    ≈ 6 MB PSRAM), keep the same footprint threshold and LRU policy.
+  Tiles were cut with `sips` from the Natural Earth TIFF (crop 360-px strips,
+    then 360×360 tiles, JPEG quality 78).
 - Dragging pans temporarily; the view glides back after 4 s.
 - On-screen menu (`drawMenu()`, `onTap()`): a tap (pointer moved < 6 px) on the
   bottom HUD tab opens a centred "VIEW" panel with
@@ -106,8 +133,8 @@ display size.
    edge (`edgeBand()`): a flat edge only as wide as the content, then 58° flanks
    out to the screen circle, softened corners, hairline along the edge:
    - top tab (edge at 0.068·s, text 0.034·s): UTC time;
-   - bottom tab (edge at 0.88·s, rows at 0.912·s / 0.957·s): primary row (0.038·s) = pin icon + distance
-     from Munich at ground level (10 Hz, `rangeToHome()`) | clock icon + Munich
+   - bottom tab (edge at 0.88·s, rows at 0.912·s / 0.957·s): primary row (0.038·s) = dimension-line icon |←→| + distance
+     from Munich at ground level (10 Hz, `rangeToHome()`) | minimum-curve icon (∪ with a dot) + Munich
      local time of the next range minimum (20 s scan up to 4 h, ternary
      refinement to 1 s, `findNextPass()`); secondary row (0.028·s) =
      latitude | longitude | altitude icon + altitude.

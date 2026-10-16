@@ -30,6 +30,8 @@
     trackPast: '#ff6b6b',
     mesh: 'rgba(255, 120, 120, .55)',
     footprint: 'rgba(255, 226, 122, .9)',
+    hud: '#4dff7a',                   // pilot HUD green
+    hudShadow: 'rgba(0, 0, 0, .65)',
     behind: '#c4c8cc',
     sat: '#ffcc00',
     reticle: 'rgba(30, 30, 30, .55)',
@@ -124,19 +126,59 @@
     c.width = img.width; c.height = img.height;
     const g = c.getContext('2d');
     g.drawImage(img, 0, 0);
-    const data = g.getImageData(0, 0, c.width, c.height);
-    const px = data.data;
-    for (let i = 0; i < px.length; i += 4) {
-      const r = px[i], gg = px[i + 1], b = px[i + 2];
-      if (r > 242 && gg > 242 && b > 242) { px[i + 3] = 0; continue; }
-      const m = (r + gg + b) / 3;
-      for (let k = 0; k < 3; k++) {
-        const v = (m + (px[i + k] - m) * 2.4) / 255;
-        px[i + k] = 255 * Math.pow(Math.min(1, Math.max(0, v)), 1.35);
-      }
-    }
+    const px = g.getImageData(0, 0, c.width, c.height).data;
+    boostTerrain(px);
     state.tex = { w: c.width, h: c.height, px };
     state.dirty = true;
+  }
+
+  // Terrain colour boost (saturation ×2.4, gamma 1.35 via a 256-entry LUT); white → water
+  // (alpha 0). Shared by the global texture and the high-res tiles. On the ESP this should
+  // be baked into the tiles offline.
+  const GAMMA_LUT = new Uint8Array(256).map((_, i) => Math.round(255 * Math.pow(i / 255, 1.35)));
+  function boostTerrain(px) {
+    for (let i = 0; i < px.length; i += 4) {
+      const r = px[i], g = px[i + 1], b = px[i + 2];
+      if (r > 242 && g > 242 && b > 242) { px[i + 3] = 0; continue; }
+      const m = (r + g + b) / 3;
+      px[i] = GAMMA_LUT[Math.max(0, Math.min(255, Math.round(m + (r - m) * 2.4)))];
+      px[i + 1] = GAMMA_LUT[Math.max(0, Math.min(255, Math.round(m + (g - m) * 2.4)))];
+      px[i + 2] = GAMMA_LUT[Math.max(0, Math.min(255, Math.round(m + (b - m) * 2.4)))];
+    }
+  }
+
+  // ---------- high-res terrain tiles (pilot view only) ----------
+  // Full HYP_50M_SR (10800×5400, ~3.7 km/texel) cut into 15×30 tiles of 360×360 px (12°×12°)
+  // at web/tiles/hyp/<row>_<col>.jpg. Only tiles under the pilot camera are loaded, into a
+  // fixed-size LRU cache; pixels whose ground footprint is coarse (toward the horizon) keep
+  // using the 2048-wide global texture. ESP: HW JPEG decode → RGB565, 24 × 253 KB PSRAM.
+  const HI = { T: 360, ROWS: 15, COLS: 30, CACHE: 24, MAX_LOADS: 3, FOOTPRINT_KM: 12 };
+  const hiTiles = new Map();       // key → {px, used}
+  const hiPending = new Set();
+  let hiFrame = 0;
+  const hiCanvas = document.createElement('canvas');
+  hiCanvas.width = hiCanvas.height = HI.T;
+  const hiCtx = hiCanvas.getContext('2d', { willReadFrequently: true });
+
+  function requestHiTile(key) {
+    if (hiPending.has(key) || hiPending.size >= HI.MAX_LOADS) return;
+    hiPending.add(key);
+    const img = new Image();
+    img.onload = () => {
+      hiCtx.drawImage(img, 0, 0);
+      const px = hiCtx.getImageData(0, 0, HI.T, HI.T).data;
+      boostTerrain(px);
+      hiTiles.set(key, { px, used: hiFrame });
+      if (hiTiles.size > HI.CACHE) {   // evict the least recently used tile
+        let oldK = -1, oldU = Infinity;
+        for (const [k, t] of hiTiles) if (t.used < oldU) { oldU = t.used; oldK = k; }
+        hiTiles.delete(oldK);
+      }
+      hiPending.delete(key);
+      state.dirty = true;
+    };
+    img.onerror = () => hiPending.delete(key);
+    img.src = `tiles/hyp/${Math.floor(key / HI.COLS)}_${key % HI.COLS}.jpg`;
   }
 
   // NASA "Earth at Night" (Suomi NPP VIIRS, 2012), equirectangular. The image has a dim
@@ -208,6 +250,9 @@
     const RE = EARTH_R_KM, cc2 = cam ? cam.c[0] ** 2 + cam.c[1] ** 2 + cam.c[2] ** 2 : 0;
     const tHorizon = Math.sqrt(Math.max(0, cc2 - RE * RE));
     const grat = cam && ui.graticule.checked;
+    const hiMaxT = cam ? HI.FOOTPRINT_KM / pixAng : 0;   // use tiles while hitT < this
+    let hiKey = -1, hiTile = null;
+    if (cam) hiFrame++;
     const [sr, sg, sb] = C.sea, [lr, lg, lb] = C.landRgb, [kr, kg, kb] = C.coastRgb;
     const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(s, Math.ceil(cx + r));
     const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(s, Math.ceil(cy + r));
@@ -269,8 +314,24 @@
         const oi = (py * s + pxl) * 4;
 
         let R = sr, G = sg, B = sb;
-        let coast = false;
-        if (mask) {
+        let coast = false, hiDone = false;
+        if (cam && hitT < hiMaxT) {
+          // High-res tile lookup; consecutive pixels mostly hit the same tile.
+          const X = fu * HI.COLS * HI.T, Y = fv * HI.ROWS * HI.T;
+          const col = (X / HI.T) | 0, row = (Y / HI.T) | 0, key = row * HI.COLS + col;
+          if (key !== hiKey) {
+            hiKey = key; hiTile = hiTiles.get(key) || null;
+            if (hiTile) hiTile.used = hiFrame; else requestHiTile(key);
+          }
+          if (hiTile) {
+            const tx = (X | 0) - col * HI.T, ty = (Y | 0) - row * HI.T, t = hiTile.px;
+            const ti = (ty * HI.T + tx) * 4, water = t[ti + 3] === 0;
+            if (!water) { R = t[ti]; G = t[ti + 1]; B = t[ti + 2]; }
+            coast = (tx + 1 < HI.T && (t[ti + 7] === 0) !== water) || (ty + 1 < HI.T && (t[ti + HI.T * 4 + 3] === 0) !== water);
+            hiDone = true;
+          }
+        }
+        if (!hiDone && mask) {
           const mu = Math.floor(fu * MASK_W), mv = Math.floor(fv * MASK_H), mi = mv * MASK_W + mu;
           const land = mask[mi];
           coast = land !== mask[mv * MASK_W + ((mu + 1) % MASK_W)] || (mv + 1 < MASK_H && land !== mask[mi + MASK_W]);
@@ -611,7 +672,6 @@
       const tp = performance.now();
       ctx.drawImage(renderGlobePixels(ui.night.checked), 0, 0);
       perf.pixels = performance.now() - tp;
-      drawBehindEarth();
     }
     const rim = ctx.createRadialGradient(c, c, c * 0.75, c, c, c);
     rim.addColorStop(0, 'rgba(0,0,0,0)');
@@ -622,7 +682,7 @@
     if (state.cam) {
       drawHome();
       drawTrack();
-      drawProgradeMarker();
+      drawPilotHud();
     }
     drawHud();
     if (state.menuOpen) drawMenu();
@@ -645,9 +705,107 @@
     };
     ctx.save();
     ctx.lineCap = 'round';
-    ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.lineWidth = s / 160; shape(); ctx.stroke();
-    ctx.strokeStyle = '#ffd23f'; ctx.lineWidth = s / 300; shape(); ctx.stroke();
+    ctx.strokeStyle = C.hudShadow; ctx.lineWidth = s / 160; shape(); ctx.stroke();
+    ctx.strokeStyle = C.hud; ctx.lineWidth = s / 300; shape(); ctx.stroke();
     ctx.restore();
+  }
+
+  // Screen position of a world direction (unit vector, ECI) through the pilot camera.
+  function projectDir(d) {
+    const cam = state.cam, s = state.size, z = vdot(d, cam.f);
+    if (z <= 0.05) return null;
+    const k = (s / 2) / Math.tan(PILOT_HALF_FOV);
+    return { x: s / 2 + k * vdot(d, cam.rt) / z, y: s / 2 - k * vdot(d, cam.u) / z };
+  }
+
+  // Fighter-style HUD, fixed to the screen: pitch ladder (conformal to the local
+  // horizontal), heading tape, boresight, speed and altitude boxes, prograde marker.
+  function drawPilotHud() {
+    const s = state.size, c = s / 2, cam = state.cam;
+    const up = vnorm(cam.c);                                         // local vertical
+    const north = vnorm([-up[2] * up[0], -up[2] * up[1], 1 - up[2] * up[2]]);   // ECI z on the horizontal plane
+    const east = vcross(north, up);
+    // Camera forward split into horizontal heading + pitch.
+    const fu = vdot(cam.f, up);
+    const hf = vnorm(cam.f.map((x, i) => x - fu * up[i]));
+    const heading = ((Math.atan2(vdot(hf, east), vdot(hf, north)) * DEG) + 360) % 360;
+
+    const lw = Math.max(1.2, s / 360), fs = Math.round(s * 0.03);
+    ctx.save();
+    ctx.strokeStyle = C.hud; ctx.fillStyle = C.hud;
+    ctx.lineWidth = lw; ctx.lineCap = 'round';
+    ctx.shadowColor = C.hudShadow; ctx.shadowBlur = s / 160;
+    ctx.font = `600 ${fs}px ${HUD_FONT}`;
+    ctx.textBaseline = 'middle';
+
+    // Pitch ladder, clipped to the HUD glass in the middle of the screen.
+    ctx.save();
+    ctx.beginPath(); ctx.arc(c, c, s * 0.34, 0, 2 * Math.PI); ctx.clip();
+    for (let p = -80; p <= 80; p += 10) {
+      const pr = p / DEG;
+      const pt = projectDir(hf.map((x, i) => x * Math.cos(pr) + up[i] * Math.sin(pr)));
+      if (!pt) continue;
+      const half = p === 0 ? s * 0.2 : s * 0.09, gap = s * 0.045, tick = s * 0.018 * (p > 0 ? 1 : -1);
+      ctx.setLineDash(p < 0 ? [s / 70, s / 110] : []);
+      ctx.beginPath();
+      ctx.moveTo(pt.x - half, pt.y + (p ? tick : 0)); ctx.lineTo(pt.x - half, pt.y); ctx.lineTo(pt.x - gap, pt.y);
+      ctx.moveTo(pt.x + gap, pt.y); ctx.lineTo(pt.x + half, pt.y); ctx.lineTo(pt.x + half, pt.y + (p ? tick : 0));
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (p) {
+        ctx.textAlign = 'right'; ctx.fillText(String(Math.abs(p)), pt.x - half - s * 0.01, pt.y);
+        ctx.textAlign = 'left'; ctx.fillText(String(Math.abs(p)), pt.x + half + s * 0.01, pt.y);
+      }
+    }
+    ctx.restore();
+
+    // Boresight "W" fixed at the screen centre (where you are looking).
+    const w = s * 0.022;
+    ctx.beginPath();
+    ctx.moveTo(c - w * 2, c); ctx.lineTo(c - w, c); ctx.lineTo(c - w * 0.5, c + w * 0.6);
+    ctx.lineTo(c, c); ctx.lineTo(c + w * 0.5, c + w * 0.6); ctx.lineTo(c + w, c); ctx.lineTo(c + w * 2, c);
+    ctx.stroke();
+
+    // Heading tape under the time tab.
+    const ty = s * 0.135, span = 35, pxDeg = s * 0.0065;
+    ctx.textAlign = 'center';
+    for (let hd = Math.ceil((heading - span) / 5) * 5; hd <= heading + span; hd += 5) {
+      const x = c + (hd - heading) * pxDeg, h = ((hd % 360) + 360) % 360;
+      const major = h % 10 === 0;
+      ctx.beginPath(); ctx.moveTo(x, ty); ctx.lineTo(x, ty - (major ? s * 0.014 : s * 0.008)); ctx.stroke();
+      if (h % 30 === 0) {
+        const lbl = { 0: 'N', 90: 'E', 180: 'S', 270: 'W' }[h] ?? String(h / 10).padStart(2, '0');
+        ctx.fillText(lbl, x, ty - s * 0.032);
+      }
+    }
+    ctx.beginPath();   // caret + current heading box
+    ctx.moveTo(c - s * 0.012, ty + s * 0.022); ctx.lineTo(c, ty + s * 0.006); ctx.lineTo(c + s * 0.012, ty + s * 0.022);
+    ctx.stroke();
+    hudBox(String(Math.round(heading) % 360).padStart(3, '0'), c, ty + s * 0.048, 'center', fs);
+
+    // Speed (left) and altitude (right) boxes.
+    const g = geoOf(state.now.r, state.now.gmst);
+    const v = state.now.v, spd = Math.hypot(v.x, v.y, v.z);
+    hudBox(spd.toFixed(2), s * 0.11, c, 'left', fs, 'KM/S');
+    hudBox(g.alt.toFixed(0), s * 0.89, c, 'right', fs, 'KM');
+    ctx.restore();
+
+    drawProgradeMarker();
+  }
+
+  // Outlined HUD value box; caption under it. align: which screen side it hugs.
+  function hudBox(text, x, y, align, fs, caption) {
+    const s = state.size;
+    ctx.font = `600 ${fs}px ${HUD_FONT}`;
+    const w = ctx.measureText(text).width + fs * 0.8, h = fs * 1.35;
+    const x0 = align === 'left' ? x : align === 'right' ? x - w : x - w / 2;
+    ctx.strokeRect(x0, y - h / 2, w, h);
+    ctx.textAlign = 'center';
+    ctx.fillText(text, x0 + w / 2, y + fs * 0.04);
+    if (caption) {
+      ctx.font = `500 ${Math.round(fs * 0.7)}px ${HUD_FONT}`;
+      ctx.fillText(caption, x0 + w / 2, y + h / 2 + fs * 0.6);
+    }
   }
 
   // Soviet-instrument style lighting: lit from upper left, dark limb, glass glint.
@@ -1027,6 +1185,34 @@
       ctx.stroke();
       ctx.restore();
     },
+    // Dimension line |←→| = distance.
+    dist(x, y, h) {
+      const w = h * 0.55, a = h * 0.2;
+      ctx.save();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = Math.max(1.5, h * 0.11); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x - w, y - h * 0.32); ctx.lineTo(x - w, y + h * 0.32);   // end bars
+      ctx.moveTo(x + w, y - h * 0.32); ctx.lineTo(x + w, y + h * 0.32);
+      ctx.moveTo(x - w * 0.7, y); ctx.lineTo(x + w * 0.7, y);               // shaft
+      ctx.moveTo(x - w * 0.7 + a, y - a); ctx.lineTo(x - w * 0.7, y); ctx.lineTo(x - w * 0.7 + a, y + a);
+      ctx.moveTo(x + w * 0.7 - a, y - a); ctx.lineTo(x + w * 0.7, y); ctx.lineTo(x + w * 0.7 - a, y + a);
+      ctx.stroke();
+      ctx.restore();
+    },
+    // Curve dipping to a marked minimum = time of closest approach (next pass).
+    pass(x, y, h) {
+      const w = h * 0.5;
+      ctx.save();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = Math.max(1.5, h * 0.11); ctx.lineCap = 'round';
+      const by = y + h * 0.22;   // bottom of the U
+      ctx.beginPath();
+      ctx.moveTo(x - w, y - h * 0.48);
+      ctx.bezierCurveTo(x - w * 0.75, by + h * 0.1, x + w * 0.75, by + h * 0.1, x + w, y - h * 0.48);
+      ctx.stroke();
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(x, by - h * 0.02, h * 0.19, 0, 2 * Math.PI); ctx.fill();
+      ctx.restore();
+    },
     // Up-triangle over a ground line = altitude.
     alt(x, y, h) {
       const w = h * 0.42;
@@ -1120,8 +1306,8 @@
     if (state.sat && state.now) {
       const { lat, lon, alt } = state.sat;
       const primary = [
-        { icon: 'pin', value: String(Math.round(rangeToHome(state.now))), unit: 'km' },
-        { icon: 'clock', value: state.nextPass ? homeTime.format(state.nextPass) : '--:--' },
+        { icon: 'dist', value: String(Math.round(rangeToHome(state.now))), unit: 'km' },
+        { icon: 'pass', value: state.nextPass ? homeTime.format(state.nextPass) : '--:--' },
       ];
       const secondary = [
         { value: Math.abs(lat).toFixed(1) + '°', unit: lat >= 0 ? 'N' : 'S' },
