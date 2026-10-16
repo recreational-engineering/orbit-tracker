@@ -1105,54 +1105,59 @@
   // (the object's horizon, solid, with a compass rose); the inner ones dashed. Printed on the surface, under
   // the orbit line.
   const ELEV_RINGS = [0, 10, 20];
+  const ELEV_LABEL_AZ = { 10: 225, 20: 250 };   // label positions, between the cross arms
+  const ROSE_LABELS = { 0: 'N', 30: '3', 60: '6', 90: 'E', 120: '12', 150: '15', 180: 'S', 210: '21', 240: '24', 270: 'W', 300: '30', 330: '33' };
+
+  // Ring of ground radius `radiusDeg` around (lon, lat) as a screen polyline, broken where it
+  // is hidden or inside one of the `gaps` boxes ({x, y, hw, hh}) kept free for labels.
+  function strokeRing(lon, lat, radiusDeg, gaps) {
+    let pen = false;
+    ctx.beginPath();
+    for (let az = 0; az <= 360; az += 2) {
+      const [lo, la] = destination(lon, lat, az, radiusDeg);
+      const q = project3d(lo, la, 0);
+      const ok = q.front && q.inView && !gaps.some((b) => Math.abs(q.x - b.x) < b.hw && Math.abs(q.y - b.y) < b.hh);
+      if (ok && pen) ctx.lineTo(q.x, q.y); else if (ok) ctx.moveTo(q.x, q.y);
+      pen = ok;
+    }
+    ctx.stroke();
+  }
+
   function drawFootprint() {
     if (!state.now) return;
     const g = geoOf(state.now.r, state.now.gmst);
     const s = state.size, k = EARTH_R_KM / (EARTH_R_KM + g.alt);
-    ctx.save();
-    ctx.strokeStyle = C.footprint; ctx.fillStyle = C.footprint;
-    ctx.lineWidth = s / 200;   // same as the orbit line
     const fs = Math.round(s * 0.024), apex = project3d(g.lon, g.lat, g.alt);
+    const ringDeg = (e) => (Math.acos(k * Math.cos(e / DEG)) - e / DEG) * DEG;
+    const horizonDeg = ringDeg(0);
+    ctx.save();
+    ctx.strokeStyle = C.footprint;
+    ctx.font = `600 ${fs}px ${HUD_FONT}`;
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+
+    // Elevation labels first, so the rings can leave gaps for them.
     const labels = [];
-    let horizonDeg = 0;
+    for (const e of ELEV_RINGS.slice(1)) {
+      const [lo, la] = destination(g.lon, g.lat, ELEV_LABEL_AZ[e], ringDeg(e));
+      const q = project3d(lo, la, 0);
+      if (!q.front || !q.inView) continue;
+      if (!apex.hidden && Math.hypot(apex.x - q.x, apex.y - q.y) < s * 0.06) continue;   // under the object
+      const hw = ctx.measureText(`${e}°`).width / 2 + s * 0.008, hh = fs * 0.6;
+      if (labels.some((b) => Math.abs(b.x - q.x) < b.hw + hw && Math.abs(b.y - q.y) < b.hh + hh)) continue;
+      labels.push({ text: `${e}°`, x: q.x, y: q.y, hw, hh });
+    }
+
+    // Rings: horizon solid, the others dashed; all at the orbit-line width.
+    ctx.lineWidth = s / 200;
     for (const e of ELEV_RINGS) {
-      const er = e / DEG, radius = (Math.acos(k * Math.cos(er)) - er) * DEG;
-      const ring = d3.geoCircle().center([g.lon, g.lat]).radius(radius).precision(2)();
       ctx.setLineDash(e === 0 ? [] : [s / 55, s / 80]);
-      ctx.beginPath(); path(ring); ctx.stroke();
-      // Label point: the ring's lower-left-most visible point (nav-display style).
-      let best = null;
-      for (const [lo, la] of ring.coordinates[0]) {
-        const q = project3d(lo, la, 0);
-        if (q.front && q.inView && (!best || q.y - q.x > best.y - best.x)) best = q;
-      }
-      if (best && e > 0) labels.push({ text: `${e}°`, x: best.x, y: best.y });
-      if (e === 0) horizonDeg = radius;
+      strokeRing(g.lon, g.lat, ringDeg(e), labels);
     }
     ctx.setLineDash([]);
+    for (const L of labels) hudText(L.text, L.x, L.y, fs, 600, false, C.footprint);
 
-    // Compass rose on the horizon ring (Earth frame, azimuth from the sub-satellite point):
-    // outward ticks every 10°, longer every 30°, N / E / S / W just outside; inside, a thin
-    // cross linking N–S and E–W through the sub-satellite point.
-    const pxDeg = (isFlat() ? 180 : DEG) / discRadius();          // ground degrees per screen px at the centre
-    ctx.lineWidth = Math.max(1, s / 360);
-    ctx.beginPath();
-    for (let az = 0; az < 360; az += 10) {
-      const major = az % 30 === 0, len = (major ? s / 55 : s / 95) * pxDeg;
-      const [lo1, la1] = destination(g.lon, g.lat, az, horizonDeg);
-      const [lo2, la2] = destination(g.lon, g.lat, az, horizonDeg + len);
-      const a = project3d(lo1, la1, 0), b = project3d(lo2, la2, 0);
-      if (!a.front || !a.inView || !b.front) continue;
-      ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
-    }
-    ctx.stroke();
-    ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
-    for (const [az, txt] of [[0, 'N'], [90, 'E'], [180, 'S'], [270, 'W']]) {
-      const [lo, la] = destination(g.lon, g.lat, az, horizonDeg + (s / 55 + fs * 0.9) * pxDeg);
-      const q = project3d(lo, la, 0);
-      if (q.front && q.inView) hudText(txt, q.x, q.y, fs, 600, true, C.footprint);
-    }
-    ctx.strokeStyle = C.footprint;   // hudText() left its outline colour set
+    // Thin cross inside the horizon ring, linking N–S and E–W through the sub-satellite point.
+    ctx.strokeStyle = C.footprint;
     ctx.lineWidth = Math.max(1, s / 480);
     ctx.beginPath();
     for (const az of [0, 90]) {
@@ -1161,14 +1166,30 @@
       ] });
     }
     ctx.stroke();
-    ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
-    const placed = [], w = fs * 1.4, h = fs * 1.1;
-    for (const L of labels) {
-      // Skip labels that would collide with another label or sit on the object.
-      if (placed.some((p) => Math.abs(p.x - L.x) < w && Math.abs(p.y - L.y) < h)) continue;
-      if (!apex.hidden && Math.hypot(apex.x - L.x, apex.y - L.y) < s * 0.06) continue;
-      hudText(L.text, L.x, L.y, fs, 600, true, C.footprint);
-      placed.push(L);
+
+    // Compass rose outside the horizon ring (Earth frame, azimuth from the sub-satellite
+    // point): ticks every 10°, long every 30°, nav-display labels (N 3 6 E 12 …) placed in
+    // screen space beyond the tick ends so they never touch the ticks.
+    const pxDeg = (isFlat() ? 180 : DEG) / discRadius();
+    ctx.lineWidth = Math.max(1, s / 360);
+    ctx.beginPath();
+    const ends = [];
+    for (let az = 0; az < 360; az += 10) {
+      const major = az % 30 === 0, len = (major ? s / 50 : s / 95) * pxDeg;
+      const [lo1, la1] = destination(g.lon, g.lat, az, horizonDeg);
+      const [lo2, la2] = destination(g.lon, g.lat, az, horizonDeg + len);
+      const a = project3d(lo1, la1, 0), b = project3d(lo2, la2, 0);
+      if (!a.front || !a.inView || !b.front) continue;
+      ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+      if (major) ends.push({ az, a, b });
+    }
+    ctx.stroke();
+    for (const { az, a, b } of ends) {
+      const dx = b.x - a.x, dy = b.y - a.y, n = Math.hypot(dx, dy) || 1;
+      const txt = ROSE_LABELS[az], big = az % 90 === 0, lfs = big ? fs : Math.round(fs * 0.82);
+      ctx.font = `600 ${lfs}px ${HUD_FONT}`;
+      const off = Math.max(ctx.measureText(txt).width, lfs) * 0.6 + s * 0.006;
+      hudText(txt, b.x + dx / n * off, b.y + dy / n * off, lfs, 600, true, C.footprint);
     }
     ctx.restore();
   }

@@ -125,16 +125,19 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
      Night 2012, red channel) × n.
    No per-frame vector clipping: on desktop this pass is ~50–65 ms at 480².
 4. Dashed country borders (110m), faint white 10° graticule (vector).
-4b. Elevation rings (`drawFootprint()`, all views but pilot), like a nav display's
-   range rings around the sub-satellite point: 0° (the object's horizon,
-   outermost, solid), 10° and 20° elevation (dashed s/55 : s/80); ground radius
-   acos(R·cos ε / (R + h)) − ε. Amber/yellow #ffc800, width s/200. Small yellow
-   "10°" / "20°" labels with a dark outline at each inner ring's lower-left
-   visible point, skipped if they would overlap another label or the object.
-   Compass rose on the horizon ring, Earth frame (azimuth from the sub-satellite
-   point): outward ticks every 10° (s/95), every 30° longer (s/55), N/E/S/W
-   just outside the ring; inside, a thin 1-px cross linking N–S and E–W
-   through the sub-satellite point. Printed on the surface, under the orbit line.
+4b. Elevation rings + compass rose (`drawFootprint()`, `strokeRing()`, all views
+   but pilot), like a nav display around the sub-satellite point:
+   - rings at 0° (the object's horizon, solid), 10° and 20° elevation (dashed
+     s/55 : s/80); ground radius acos(R·cos ε / (R + h)) − ε; amber #ffc800,
+     width s/200; drawn as screen polylines that leave a gap for their label;
+   - "10°" / "20°" labels sit in those gaps at azimuth 225° / 250° (between
+     the cross arms), skipped if on the object or overlapping;
+   - thin 1-px cross linking N–S and E–W through the sub-satellite point;
+   - rose outside the horizon ring (Earth frame): ticks every 10° (s/95),
+     every 30° long (s/50); labels N 3 6 E 12 15 S 21 24 W 30 33 (cardinals
+     larger), placed in screen space beyond each tick end along its outward
+     direction, so they keep clear of the ticks even where foreshortened.
+   Printed on the surface, under the orbit line.
 5. Sphere lighting (globe views; `sphereLayers()` / `drawGlobeShading()`),
    applied after everything printed on the globe: per disc pixel normal
    N = (x, y, √(1−x²−y²)), lamp L = norm(−0.5, 0.6, 0.62);
