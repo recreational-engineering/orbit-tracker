@@ -126,11 +126,9 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
    No per-frame vector clipping: on desktop this pass is ~50–65 ms at 480².
 4. Dashed country borders (110m), faint white 10° graticule (vector).
 4b. Both views: the object's horizon on the ground — small circle around
-   the sub-satellite point with radius acos(R / (R + h)), deep yellow-orange
-   #ffa400 at the orbit-line width s/200, printed on the surface under the
-   orbit line (`drawFootprint()`). Visibility cone (`drawCone()`, globe views,
-   object in view): convex hull of the object and the projected circle,
-   filled rgba(255,164,0,.07), drawn above the globe, below line and object.
+   the sub-satellite point with radius acos(R / (R + h)), aviation amber/yellow
+   #ffc800 at the orbit-line width s/200, printed on the surface under the
+   orbit line (`drawFootprint()`).
 5. Sphere lighting (globe views; `sphereLayers()` / `drawGlobeShading()`),
    applied after everything printed on the globe: per disc pixel normal
    N = (x, y, √(1−x²−y²)), lamp L = norm(−0.5, 0.6, 0.62);
