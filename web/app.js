@@ -186,6 +186,47 @@
     img.src = `tiles/hyp/${Math.floor(key / HI.COLS)}_${key % HI.COLS}.jpg`;
   }
 
+  // High-res city lights for the pilot view: the same NASA 2012 night image at 13500×6750
+  // (~2.7 km/px) scaled to 10800×5400 and cut on the same 15×30 grid as the terrain
+  // (web/tiles/lights/<row>_<col>.jpg). Decoded to one byte per texel (LIGHTS_LUT) and only
+  // requested for night-side pixels, so day-side passes load nothing extra.
+  // 2×2 box-filter downsample of a one-byte-per-texel image (lights mip levels).
+  function halve(px, w, h) {
+    const w2 = w >> 1, h2 = h >> 1, out = new Uint8Array(w2 * h2);
+    for (let y = 0; y < h2; y++) {
+      const r0 = 2 * y * w, r1 = r0 + w;
+      for (let x = 0; x < w2; x++) {
+        const i = 2 * x;
+        // Average with a mild gain, so averaged-out small towns don't fade too much.
+        out[y * w2 + x] = Math.min(255, (px[r0 + i] + px[r0 + i + 1] + px[r1 + i] + px[r1 + i + 1]) * 0.32);
+      }
+    }
+    return out;
+  }
+  const LIGHTS_LUT = new Uint8Array(256).map((_, r) => 255 * Math.min(1, Math.pow(Math.max(0, (r - 45) / 170), 1.1)));
+  const litTiles = new Map();      // key → {px: Uint8Array T×T, used}
+  const litPending = new Set();
+  function requestLitTile(key) {
+    if (litPending.has(key) || litPending.size >= HI.MAX_LOADS) return;
+    litPending.add(key);
+    const img = new Image();
+    img.onload = () => {
+      hiCtx.drawImage(img, 0, 0);
+      const src = hiCtx.getImageData(0, 0, HI.T, HI.T).data, px = new Uint8Array(HI.T * HI.T);
+      for (let i = 0; i < px.length; i++) px[i] = LIGHTS_LUT[src[i * 4]];
+      litTiles.set(key, { px, px1: halve(px, HI.T, HI.T), used: hiFrame });   // + one mip level
+      if (litTiles.size > HI.CACHE) {
+        let oldK = -1, oldU = Infinity;
+        for (const [k, t] of litTiles) if (t.used < oldU) { oldU = t.used; oldK = k; }
+        litTiles.delete(oldK);
+      }
+      litPending.delete(key);
+      state.dirty = true;
+    };
+    img.onerror = () => litPending.delete(key);
+    img.src = `tiles/lights/${Math.floor(key / HI.COLS)}_${key % HI.COLS}.jpg`;
+  }
+
   // NASA "Earth at Night" (Suomi NPP VIIRS, 2012), equirectangular. The image has a dim
   // blue land/sea background; the warm city lights stand out in the red channel.
   async function loadNightLights() {
@@ -198,10 +239,15 @@
     g.drawImage(img, 0, 0);
     const src = g.getImageData(0, 0, c.width, c.height).data;
     const px = new Uint8Array(c.width * c.height);
-    for (let i = 0; i < px.length; i++) {
-      const v = Math.max(0, (src[i * 4] - 45) / 170);
-      px[i] = 255 * Math.min(1, Math.pow(v, 1.1));
+    for (let i = 0; i < px.length; i++) px[i] = LIGHTS_LUT[src[i * 4]];
+    // Mip pyramid (2048 → 256 wide): sample the level whose texel is at least as large as the
+    // pixel's ground footprint, so tiny city lights don't flicker while the view moves.
+    const mips = [{ w: c.width, h: c.height, px }];
+    while (mips.length < 4) {
+      const m = mips[mips.length - 1];
+      mips.push({ w: m.w >> 1, h: m.h >> 1, px: halve(m.px, m.w, m.h) });
     }
+    state.lightMips = mips;
     state.lights = { w: c.width, h: c.height, px };
     state.dirty = true;
   }
@@ -256,7 +302,11 @@
     const tHorizon = Math.sqrt(Math.max(0, cc2 - RE * RE));
     const grat = cam && ui.graticule.checked;
     const hiMaxT = cam ? HI.FOOTPRINT_KM / pixAng : 0;   // use tiles while hitT < this
-    let hiKey = -1, hiTile = null;
+    let hiKey = -1, hiTile = null, litKey = -1, litTile = null;
+    // Ground footprint of one screen pixel (km) → lights level of detail.
+    const kmPerPxGlobe = RE / r, kmPerPxFlat = Math.PI * RE / r;
+    const LIGHT_TEXEL_KM = 2 * Math.PI * RE / 2048;   // global lights level 0 (~19.5 km)
+    const mips = state.lightMips;
     if (cam) hiFrame++;
     const [sr, sg, sb] = C.sea, [lr, lg, lb] = C.landRgb, [kr, kg, kb] = C.coastRgb;
     const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(s, Math.ceil(cx + r));
@@ -268,6 +318,7 @@
         const d = Xs * Xs + Ys * Ys;
         if (d > 1) continue;
         let lon, lat, ex, ey, ez;   // geographic position and Earth-fixed unit normal
+        let fpKm = 0;               // ground footprint of this pixel (km), for the lights LOD
         let hitT = 0;               // pilot: distance from the camera to the ground point (km)
         if (cam) {
           const { c, f, u, rt } = cam;
@@ -293,6 +344,8 @@
           }
           hitT = t;
           const nx = (c[0] + t * dx) / RE, ny = (c[1] + t * dy) / RE, nz = (c[2] + t * dz) / RE;
+          const cosi = -(nx * dx + ny * dy + nz * dz);   // incidence of the view ray on the ground
+          fpKm = t * pixAng / (cosi > 0.15 ? cosi : 0.15);
           ex = nx * cgm + ny * sgm; ey = -nx * sgm + ny * cgm; ez = nz;   // ECI → Earth-fixed
           lon = Math.atan2(ey, ex);
           lat = Math.asin(Math.max(-1, Math.min(1, ez)));
@@ -301,10 +354,12 @@
           // Greenwich pointing down, longitude increasing counter-clockwise.
           lat = Math.PI / 2 - Math.sqrt(d) * Math.PI;
           lon = Math.atan2(Xs, -Ys) - lam;
+          fpKm = kmPerPxFlat;
           const cl = Math.cos(lat);
           ex = cl * Math.cos(lon); ey = cl * Math.sin(lon); ez = Math.sin(lat);
         } else {
           const Z = Math.sqrt(1 - d);
+          fpKm = kmPerPxGlobe / (Z > 0.15 ? Z : 0.15);   // stretched toward the limb
           // Undo d3's [λ, φ, γ] rotation: spin back by γ, tilt back by φ, shift longitude by λ.
           const X = Xs * cg + Ys * sg2;
           const Y = Ys * cg - Xs * sg2;
@@ -319,11 +374,13 @@
         const oi = (py * s + pxl) * 4;
 
         let R = sr, G = sg, B = sb;
-        let coast = false, hiDone = false;
+        let coast = false, hiDone = false, hiIdx = -1, key = -1;
         if (cam && hitT < hiMaxT) {
           // High-res tile lookup; consecutive pixels mostly hit the same tile.
           const X = fu * HI.COLS * HI.T, Y = fv * HI.ROWS * HI.T;
-          const col = (X / HI.T) | 0, row = (Y / HI.T) | 0, key = row * HI.COLS + col;
+          const col = (X / HI.T) | 0, row = (Y / HI.T) | 0;
+          key = row * HI.COLS + col;
+          hiIdx = ((Y | 0) - row * HI.T) * HI.T + ((X | 0) - col * HI.T);   // texel inside the tile
           if (key !== hiKey) {
             hiKey = key; hiTile = hiTiles.get(key) || null;
             if (hiTile) hiTile.used = hiFrame; else requestHiTile(key);
@@ -357,7 +414,25 @@
             const a = 0.78 * n;
             R = R * (1 - a) + 4 * a; G = G * (1 - a) + 8 * a; B = B * (1 - a) + 28 * a;
             if (lights) {
-              const L = lights.px[Math.floor(fv * lights.h) * lights.w + Math.floor(fu * lights.w)] * n;
+              // Level of detail by footprint: high-res tile (pilot, ≤ 5 km), its half-res mip
+              // (≤ 10 km), else the global mip whose texel covers the footprint.
+              let L = -1;
+              if (key >= 0 && fpKm < 10) {
+                if (key !== litKey) {
+                  litKey = key; litTile = litTiles.get(key) || null;
+                  if (litTile) litTile.used = hiFrame; else requestLitTile(key);
+                }
+                if (litTile) {
+                  if (fpKm < 5) L = litTile.px[hiIdx];
+                  else { const ty = (hiIdx / HI.T) | 0, tx = hiIdx - ty * HI.T; L = litTile.px1[(ty >> 1) * (HI.T >> 1) + (tx >> 1)]; }
+                }
+              }
+              if (L < 0) {
+                const lv = mips ? Math.min(mips.length - 1, Math.max(0, Math.ceil(Math.log2(fpKm / LIGHT_TEXEL_KM)))) : 0;
+                const m = mips ? mips[lv] : lights;
+                L = m.px[Math.floor(fv * m.h) * m.w + Math.floor(fu * m.w)];
+              }
+              L *= n;
               R += L; G += L * 0.8; B += L * 0.45;
             }
           }

@@ -96,6 +96,19 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
   - ESP port: bake the colour boost into the tiles offline, decode with the
     P4 hardware JPEG decoder to RGB565 (360×360×2 B = 253 KB per tile, 24 tiles
     ≈ 6 MB PSRAM), keep the same footprint threshold and LRU policy.
+  High-res city lights (pilot view only, `requestLitTile()`): NASA Earth at
+  Night 2012 at 13500×6750 (~2.7 km/px), scaled to 10800×5400 and cut on the
+  same 15×30 grid (`web/tiles/lights/<row>_<col>.jpg`), so a pixel's terrain
+  tile key/texel index is reused for the lights lookup. Decoded to 1 byte per
+  texel via `LIGHTS_LUT` (red channel), own 24-tile LRU cache, requested only
+  for night-side pixels inside the high-res footprint; elsewhere the 2048-wide
+  global lights texture is used. ESP: 360×360×1 B = 130 KB per tile.
+  Anti-flicker (all views): city lights use a level of detail by the pixel's
+  ground footprint (globe: R/r ÷ Nz, flat: πR/r, pilot: t·pixel angle ÷ cos
+  incidence) — pilot tile (≤ 5 km), its 180² mip (≤ 10 km), else the global
+  mip 2048/1024/512/256 whose texel covers the footprint. Mips are 2×2 averages
+  ×1.28 (`halve()`), so tiny lights fade smoothly instead of popping while
+  the view moves; still one lookup per night pixel.
   Tiles were cut with `sips` from the Natural Earth TIFF (crop 360-px strips,
     then 360×360 tiles, JPEG quality 78).
 - Dragging pans temporarily; the view glides back after 4 s.
