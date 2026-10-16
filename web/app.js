@@ -12,10 +12,11 @@
   const TRACK_STEP_S = 30;
   const MARK_STEP_S = 60;      // 1-minute travel-time marks
   const MARK_MAJOR = 5;        // every 5th mark (whole 5 minutes) is a longer tick
-  const SPIN_PERIOD_S = 30;    // Earth-spin view: one turn on screen per 30 s
+  const SPIN_PERIOD_S = 60;    // Earth-spin view: one turn on screen per minute
   // Orbit-line opacity: the line ahead is solid; the part already flown fades out
   // linearly until it is gone at −TRACK_SPAN_S. Used for line, ticks and hidden parts.
   const trackAlpha = (t) => (t >= 0 ? 1 : Math.max(0, 1 + t / TRACK_SPAN_S));
+  const BEHIND_ALPHA = 0.28;   // hidden (behind-the-Earth) line and ticks: just a faint marking
   const HOME = { name: 'Munich', lon: 11.575, lat: 48.137, tz: 'Europe/Berlin' };
   const PASS_SEARCH_STEP_S = 20;
   const PASS_SEARCH_SPAN_S = 4 * 3600;
@@ -1053,7 +1054,7 @@
       const g = geoOf(p.r, frameGmst(p));
       const cur = { t: p.t, ...project3d(g.lon, g.lat, g.alt) };
       if (prev && (prev.hidden || cur.hidden) && prev.inView && cur.inView) {
-        ctx.globalAlpha = trackAlpha((prev.t + cur.t) / 2);
+        ctx.globalAlpha = BEHIND_ALPHA * trackAlpha((prev.t + cur.t) / 2);
         ctx.lineWidth = s / 260;
         ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(cur.x, cur.y); ctx.stroke();
       }
@@ -1065,7 +1066,7 @@
     for (const m of state.marks) {
       const [a, b] = markPoints(m);
       if (!a.hidden) continue;
-      drawTick(a, b, m.major, C.tickBehind, trackAlpha(m.t));
+      drawTick(a, b, m.major, C.tickBehind, BEHIND_ALPHA * trackAlpha(m.t));
     }
     ctx.lineCap = 'round';
 

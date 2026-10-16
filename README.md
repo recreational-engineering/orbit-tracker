@@ -31,7 +31,7 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
 (`orbit`), PILOT REFERENCE (`pilot`), FLAT EARTH (`flat`).
 - `spin` ("Earth spin") — same content as ground reference, seen from the
   equatorial plane (perpendicular to the spin axis), north up, the globe
-  turning about the real axis at one turn per `SPIN_PERIOD_S` = 30 s; the
+  turning about the real axis at one turn per `SPIN_PERIOD_S` = 60 s; the
   surface drifts left → right (eastward rotation). Starts with Munich's
   longitude centred; redrawn every frame.
 - `orbit` ("Satellite reference") — object fixed at screen centre, flight direction up. The track is
@@ -139,8 +139,8 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
 6. Centre reticle.
 7. Track: one dark crisp red #c8102e, width s/200, for the whole visible line.
    Opacity `trackAlpha(t)`: 1 for the part ahead; the part already flown fades
-   linearly to 0 at −60 min. Same rule for the ticks, the grey hidden line and
-   hidden ticks, and the pilot-reference line. Points are
+   linearly to 0 at −60 min. Same rule for the ticks and the pilot-reference line; the grey hidden line
+   and hidden ticks additionally get `BEHIND_ALPHA` = 0.28 (a faint marking). Points are
    lifted by altitude (radius × (1 + h/6371)); hidden = behind the Earth disk
    (`project3d()`). Hidden parts are NOT drawn through the globe.
 7a. Behind-the-Earth display (`drawBehindEarth()`, globe views only): hidden
