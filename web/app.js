@@ -33,7 +33,8 @@
     graticule: 'rgba(255, 255, 255, .16)',
     track: '#c8102e',                 // orbit line and its ticks: one dark, crisp red
     tickBehind: '#c4c8cc',            // hidden ticks: same grey as the hidden line
-    footprint: 'rgba(255, 226, 122, .9)',
+    footprint: '#ffa400',             // horizon circle: deep crisp yellow-orange
+    cone: 'rgba(255, 164, 0, .07)',   // visibility cone: very faint
     hud: '#4dff7a',                   // pilot HUD green
     hudShadow: 'rgba(0, 0, 0, .65)',
     behind: '#c4c8cc',
@@ -670,6 +671,7 @@
     ctx.restore();
 
     if (ui.reticle.checked && !isFlat()) drawReticle(cx, cy, r);
+    drawCone();
     drawHome();
     drawTrack();
     drawMarkTicks();
@@ -1106,9 +1108,40 @@
     const s = state.size;
     ctx.save();
     ctx.strokeStyle = C.footprint;
-    ctx.lineWidth = Math.max(1, s / 420);
+    ctx.lineWidth = s / 200;   // same as the orbit line; printed on the surface, under it
     ctx.beginPath(); path(d3.geoCircle().center([g.lon, g.lat]).radius(radius).precision(2)()); ctx.stroke();
     ctx.restore();
+  }
+
+  // Visibility cone from the object down to its horizon circle, as a very faint tint: the
+  // filled convex hull of the object and the projected circle (globe views only, and only
+  // while the object itself is in view).
+  function drawCone() {
+    if (!state.now || isFlat()) return;
+    const g = geoOf(state.now.r, state.now.gmst);
+    const apex = project3d(g.lon, g.lat, g.alt);
+    if (apex.hidden) return;
+    const radius = Math.acos(EARTH_R_KM / (EARTH_R_KM + g.alt)) * DEG;
+    const ring = d3.geoCircle().center([g.lon, g.lat]).radius(radius).precision(5)().coordinates[0];
+    const pts = ring.map(([lo, la]) => { const q = project3d(lo, la, 0); return [q.x, q.y]; });
+    pts.push([apex.x, apex.y]);
+    const hull = convexHull(pts);
+    ctx.save();
+    ctx.fillStyle = C.cone;
+    ctx.beginPath();
+    hull.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // Andrew's monotone chain; points [[x, y], …] → hull in order.
+  function convexHull(pts) {
+    const p = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    const lower = [], upper = [];
+    for (const q of p) { while (lower.length > 1 && cross(lower[lower.length - 2], lower[lower.length - 1], q) <= 0) lower.pop(); lower.push(q); }
+    for (const q of p.reverse()) { while (upper.length > 1 && cross(upper[upper.length - 2], upper[upper.length - 1], q) <= 0) upper.pop(); upper.push(q); }
+    return lower.slice(0, -1).concat(upper.slice(0, -1));
   }
 
   // Munich view: short ticks across the drawn track at each 5-min mark.
