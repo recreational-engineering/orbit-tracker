@@ -37,7 +37,7 @@ display size.
   pole, whole Earth in the disc (south pole = rim), Greenwich pointing down,
   longitude increasing counter-clockwise. Per-pixel inverse: polar distance =
   (r / R)·180°, lon = atan2(x, −y) − λ. Ground-relative track drawn on the
-  ground (nothing hidden), 5-min ticks, horizon circle; no sphere lighting
+  ground (nothing hidden), 1-min ticks, horizon circle; no sphere lighting
   (rim vignette + glint only), no reticle. Dragging only spins around the pole.
 - `pilot` ("Pilot view") — perspective view from the object looking prograde
   (camera at the ECI position, forward = inertial velocity, up = radial out;
@@ -137,8 +137,7 @@ display size.
    parts keep the real orbit's projected shape but are drawn as a solid grey
    (#c4c8cc) line printed on the visible surface (inside the globe clip, under
    the glass shading), so the globe stays opaque. A hidden object is a hollow grey
-   ring (radius s/55, stroke = track width s/260) at its projected position (no stage model); in ground view hidden 5-min
-   ticks are grey.
+   ring (radius s/55, stroke = track width s/260) at its projected position (no stage model).
 7b. Travel-time ticks (`drawMarkTicks()`, `drawTick()`): one per minute, at
    absolute minutes (`state.marks`, `MARK_STEP_S = 60`), pinned to the ground
    point the object passes at that minute (Earth-fixed), so the object visibly
