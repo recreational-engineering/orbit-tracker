@@ -137,8 +137,7 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
      polylines that skip the label boxes);
    - outside the horizon ring: 1-px ticks every 10° (s/95), every 30° long
      (s/50), and only N / E / S / W (font 0.021·s) beyond the tick ends.
-   Flat earth: only the three outlines (projected geo circles, no rose, cross
-   or labels). Printed on the surface, under the orbit line.
+   Printed on the surface, under the orbit line.
 5. Sphere lighting (globe views; `sphereLayers()` / `drawGlobeShading()`),
    applied after everything printed on the globe: per disc pixel normal
    N = (x, y, √(1−x²−y²)), lamp L = norm(−0.5, 0.6, 0.62);

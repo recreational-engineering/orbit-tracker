@@ -1146,17 +1146,6 @@
     const horizonDeg = ringDeg(0);
     ctx.save();
     ctx.strokeStyle = C.footprint;
-
-    if (isFlat()) {
-      // Flat earth: just the three (distorted) outlines, drawn as projected geo circles so
-      // the map's own clipping handles the rim; no rose, cross or labels.
-      for (const e of ELEV_RINGS) {
-        ctx.lineWidth = e === 0 ? Math.max(1.2, s / 320) : Math.max(0.8, s / 600);
-        ctx.beginPath(); path(d3.geoCircle().center([g.lon, g.lat]).radius(ringDeg(e)).precision(1)()); ctx.stroke();
-      }
-      ctx.restore();
-      return;
-    }
     ctx.font = `600 ${rfs}px ${HUD_FONT}`;
     ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
 
