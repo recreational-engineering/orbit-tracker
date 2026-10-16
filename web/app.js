@@ -1105,7 +1105,7 @@
   // (the object's horizon, solid, with a compass rose); the inner ones dashed. Printed on the surface, under
   // the orbit line.
   const ELEV_RINGS = [0, 10, 20];
-  const ELEV_LABEL_AZ = { 10: 270, 20: 90 };   // ring labels on the W / E arms (the orbit usually runs N–S)
+  const ELEV_LABEL_AZ = 270;   // ring labels on the W arm (the orbit usually runs N–S)
   const ROSE_LABELS = { 0: 'N', 90: 'E', 180: 'S', 270: 'W' };
 
   // Ring of ground radius `radiusDeg` around (lon, lat) as a screen polyline, broken where it
@@ -1141,46 +1141,44 @@
     if (!state.now) return;
     const g = geoOf(state.now.r, state.now.gmst);
     const s = state.size, k = EARTH_R_KM / (EARTH_R_KM + g.alt);
-    const fs = Math.round(s * 0.024), apex = project3d(g.lon, g.lat, g.alt);
+    const fs = Math.round(s * 0.021), rfs = Math.round(s * 0.018), apex = project3d(g.lon, g.lat, g.alt);
     const ringDeg = (e) => (Math.acos(k * Math.cos(e / DEG)) - e / DEG) * DEG;
     const horizonDeg = ringDeg(0);
     ctx.save();
     ctx.strokeStyle = C.footprint;
-    ctx.font = `600 ${fs}px ${HUD_FONT}`;
+    ctx.font = `600 ${rfs}px ${HUD_FONT}`;
     ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
 
     // Elevation labels first, so the rings can leave gaps for them.
     const labels = [];
     for (const e of ELEV_RINGS.slice(1)) {
-      const [lo, la] = destination(g.lon, g.lat, ELEV_LABEL_AZ[e], ringDeg(e));
+      const [lo, la] = destination(g.lon, g.lat, ELEV_LABEL_AZ, ringDeg(e));
       const q = project3d(lo, la, 0);
       if (!q.front || !q.inView) continue;
       if (!apex.hidden && Math.hypot(apex.x - q.x, apex.y - q.y) < s * 0.03) continue;   // under the object
-      const hw = ctx.measureText(`${e}°`).width / 2 + s * 0.008, hh = fs * 0.6;
+      const hw = ctx.measureText(`${e}°`).width / 2 + s * 0.003, hh = rfs * 0.55;
       if (labels.some((b) => Math.abs(b.x - q.x) < b.hw + hw && Math.abs(b.y - q.y) < b.hh + hh)) continue;
       labels.push({ text: `${e}°`, x: q.x, y: q.y, hw, hh });
     }
 
-    // Rings: horizon solid, the others dashed; all at the orbit-line width.
-    ctx.lineWidth = s / 200;
+    // Rings, all solid: the horizon a little heavier, the inner range rings fine.
     for (const e of ELEV_RINGS) {
-      ctx.setLineDash(e === 0 ? [] : [s / 55, s / 80]);
+      ctx.lineWidth = e === 0 ? Math.max(1.2, s / 320) : Math.max(0.8, s / 600);
       strokeRing(g.lon, g.lat, ringDeg(e), labels);
     }
-    ctx.setLineDash([]);
-    for (const L of labels) hudText(L.text, L.x, L.y, fs, 600, false, C.footprint);
+    for (const L of labels) hudText(L.text, L.x, L.y, rfs, 600, false, C.footprint);
 
     // Thin cross inside the horizon ring, linking N–S and E–W through the sub-satellite
-    // point; broken where the ring labels sit on the W / E arms.
+    // point; broken where the ring labels sit on the W arm.
     ctx.strokeStyle = C.footprint;
-    ctx.lineWidth = Math.max(1.4, s / 320);
+    ctx.lineWidth = Math.max(0.8, s / 600);
     for (const az of [0, 90, 180, 270]) strokeArm(g.lon, g.lat, az, horizonDeg, labels);
 
     // Compass rose outside the horizon ring (Earth frame, azimuth from the sub-satellite
     // point): ticks every 10°, long every 30°, and N / E / S / W placed in screen space
     // beyond the tick ends so they never touch the ticks.
     const pxDeg = (isFlat() ? 180 : DEG) / discRadius();
-    ctx.lineWidth = Math.max(1, s / 360);
+    ctx.lineWidth = Math.max(1, s / 480);
     ctx.beginPath();
     const ends = [];
     for (let az = 0; az < 360; az += 10) {

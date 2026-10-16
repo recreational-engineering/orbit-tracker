@@ -127,16 +127,16 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
 4. Dashed country borders (110m), faint white 10° graticule (vector).
 4b. Compass rose with elevation rings (`drawFootprint()`, `strokeRing()`,
    `strokeArm()`, all views but pilot), one nav-display style rose around the
-   sub-satellite point:
-   - outer ring = the object's horizon (0° elevation), solid; inner range rings
-     at 10° and 20° elevation, dashed s/55 : s/80; ground radius
-     acos(R·cos ε / (R + h)) − ε; amber #ffc800, width s/200;
-   - thin cross N–S / E–W through the centre (max(1.4, s/320) px);
-   - "10°" label on the W arm, "20°" on the E arm, where they cross the ring,
-     in a gap cut into both ring and arm (rings and arms are drawn as screen
+   sub-satellite point, amber #ffc800, all lines solid:
+   - outer ring = the object's horizon (0° elevation), max(1.2, s/320) px;
+     inner range rings at 10° and 20° elevation, max(0.8, s/600) px; ground
+     radius acos(R·cos ε / (R + h)) − ε;
+   - fine cross N–S / E–W through the centre, max(0.8, s/600) px;
+   - "10°" and "20°" (font 0.018·s) on the W arm where it crosses each inner
+     ring, in a gap cut into ring and arm (rings and arms are screen
      polylines that skip the label boxes);
-   - outside the horizon ring: ticks every 10° (s/95), every 30° long (s/50),
-     and only N / E / S / W, placed in screen space beyond the tick ends.
+   - outside the horizon ring: 1-px ticks every 10° (s/95), every 30° long
+     (s/50), and only N / E / S / W (font 0.021·s) beyond the tick ends.
    Printed on the surface, under the orbit line.
 5. Sphere lighting (globe views; `sphereLayers()` / `drawGlobeShading()`),
    applied after everything printed on the globe: per disc pixel normal
