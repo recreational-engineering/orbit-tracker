@@ -1132,14 +1132,15 @@
     ctx.setLineDash([]);
 
     // Compass rose on the horizon ring (Earth frame, azimuth from the sub-satellite point):
-    // inward ticks every 10°, longer every 30°, N / E / S / W just inside.
+    // outward ticks every 10°, longer every 30°, N / E / S / W just outside; inside, a thin
+    // cross linking N–S and E–W through the sub-satellite point.
     const pxDeg = (isFlat() ? 180 : DEG) / discRadius();          // ground degrees per screen px at the centre
     ctx.lineWidth = Math.max(1, s / 360);
     ctx.beginPath();
     for (let az = 0; az < 360; az += 10) {
       const major = az % 30 === 0, len = (major ? s / 55 : s / 95) * pxDeg;
       const [lo1, la1] = destination(g.lon, g.lat, az, horizonDeg);
-      const [lo2, la2] = destination(g.lon, g.lat, az, horizonDeg - len);
+      const [lo2, la2] = destination(g.lon, g.lat, az, horizonDeg + len);
       const a = project3d(lo1, la1, 0), b = project3d(lo2, la2, 0);
       if (!a.front || !a.inView || !b.front) continue;
       ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
@@ -1147,10 +1148,19 @@
     ctx.stroke();
     ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
     for (const [az, txt] of [[0, 'N'], [90, 'E'], [180, 'S'], [270, 'W']]) {
-      const [lo, la] = destination(g.lon, g.lat, az, horizonDeg - (s / 55 + fs * 0.9) * pxDeg);
+      const [lo, la] = destination(g.lon, g.lat, az, horizonDeg + (s / 55 + fs * 0.9) * pxDeg);
       const q = project3d(lo, la, 0);
       if (q.front && q.inView) hudText(txt, q.x, q.y, fs, 600, true, C.footprint);
     }
+    ctx.strokeStyle = C.footprint;   // hudText() left its outline colour set
+    ctx.lineWidth = Math.max(1, s / 480);
+    ctx.beginPath();
+    for (const az of [0, 90]) {
+      path({ type: 'LineString', coordinates: [
+        destination(g.lon, g.lat, az, horizonDeg), [g.lon, g.lat], destination(g.lon, g.lat, az + 180, horizonDeg),
+      ] });
+    }
+    ctx.stroke();
     ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
     const placed = [], w = fs * 1.4, h = fs * 1.1;
     for (const L of labels) {

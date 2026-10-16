@@ -132,8 +132,9 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
    "10°" / "20°" labels with a dark outline at each inner ring's lower-left
    visible point, skipped if they would overlap another label or the object.
    Compass rose on the horizon ring, Earth frame (azimuth from the sub-satellite
-   point): inward ticks every 10° (s/95), every 30° longer (s/55), N/E/S/W
-   just inside the ring. Printed on the surface, under the orbit line.
+   point): outward ticks every 10° (s/95), every 30° longer (s/55), N/E/S/W
+   just outside the ring; inside, a thin 1-px cross linking N–S and E–W
+   through the sub-satellite point. Printed on the surface, under the orbit line.
 5. Sphere lighting (globe views; `sphereLayers()` / `drawGlobeShading()`),
    applied after everything printed on the globe: per disc pixel normal
    N = (x, y, √(1−x²−y²)), lamp L = norm(−0.5, 0.6, 0.62);
