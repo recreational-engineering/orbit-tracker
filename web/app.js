@@ -173,7 +173,7 @@
       hiCtx.drawImage(img, 0, 0);
       const px = hiCtx.getImageData(0, 0, HI.T, HI.T).data;
       boostTerrain(px);
-      hiTiles.set(key, { px, used: hiFrame });
+      hiTiles.set(key, { px, mask: tileLandMask(key), used: hiFrame });
       if (hiTiles.size > HI.CACHE) {   // evict the least recently used tile
         let oldK = -1, oldU = Infinity;
         for (const [k, t] of hiTiles) if (t.used < oldU) { oldU = t.used; oldK = k; }
@@ -184,6 +184,26 @@
     };
     img.onerror = () => hiPending.delete(key);
     img.src = `tiles/hyp/${Math.floor(key / HI.COLS)}_${key % HI.COLS}.jpg`;
+  }
+
+  // Land/sea for a high-res tile from the land-50m vectors (the raster's own white/tint is not
+  // a reliable sea mark, e.g. Arctic seas are tinted like land). Rasterised once per tile
+  // load at 360×360; 1 = land. ESP: precompute these offline as 1-bit tiles.
+  const maskCanvas = document.createElement('canvas');
+  maskCanvas.width = maskCanvas.height = HI.T;
+  const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
+  function tileLandMask(key) {
+    const row = Math.floor(key / HI.COLS), col = key % HI.COLS, W = HI.COLS * HI.T, H = HI.ROWS * HI.T;
+    const eq = d3.geoEquirectangular().scale(W / (2 * Math.PI)).translate([W / 2 - col * HI.T, H / 2 - row * HI.T])
+      .clipExtent([[-2, -2], [HI.T + 2, HI.T + 2]]);
+    maskCtx.clearRect(0, 0, HI.T, HI.T);
+    if (state.land) {
+      maskCtx.fillStyle = '#fff';
+      maskCtx.beginPath(); d3.geoPath(eq, maskCtx)(state.land); maskCtx.fill();
+    }
+    const src = maskCtx.getImageData(0, 0, HI.T, HI.T).data, m = new Uint8Array(HI.T * HI.T);
+    for (let i = 0; i < m.length; i++) m[i] = src[i * 4] > 127 ? 1 : 0;
+    return m;
   }
 
   // High-res city lights for the pilot view: the same NASA 2012 night image at 13500×6750
@@ -386,10 +406,11 @@
             if (hiTile) hiTile.used = hiFrame; else requestHiTile(key);
           }
           if (hiTile) {
-            const tx = (X | 0) - col * HI.T, ty = (Y | 0) - row * HI.T, t = hiTile.px;
-            const ti = (ty * HI.T + tx) * 4, water = t[ti + 3] === 0;
-            if (!water) { R = t[ti]; G = t[ti + 1]; B = t[ti + 2]; }
-            coast = (tx + 1 < HI.T && (t[ti + 7] === 0) !== water) || (ty + 1 < HI.T && (t[ti + HI.T * 4 + 3] === 0) !== water);
+            // Land/sea and coastline from the vector mask tile; colour (and lakes) from the raster.
+            const tx = (X | 0) - col * HI.T, ty = (Y | 0) - row * HI.T, t = hiTile.px, m = hiTile.mask;
+            const mi = ty * HI.T + tx, land = m[mi], ti = mi * 4;
+            if (land && t[ti + 3] !== 0) { R = t[ti]; G = t[ti + 1]; B = t[ti + 2]; }
+            coast = (tx + 1 < HI.T && m[mi + 1] !== land) || (ty + 1 < HI.T && m[mi + HI.T] !== land);
             hiDone = true;
           }
         }
@@ -1865,10 +1886,41 @@
   canvas.addEventListener('dblclick', resetView);
   window.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.menuOpen) openMenu(false); });
 
-  function rotateBy(dLon, dLat) {
-    state.rotate[0] = ((state.rotate[0] + dLon + 540) % 360) - 180;
-    if (isFlat()) { state.dirty = true; return; }   // flat map only spins around the pole
-    state.rotate[1] = Math.max(-90, Math.min(90, state.rotate[1] - dLat));
+  // Quaternion helpers for d3 rotations [λ, φ, γ] (as in d3 "versor dragging").
+  function versor([l, p, g = 0]) {
+    l /= 2 * DEG; p /= 2 * DEG; g /= 2 * DEG;
+    const sl = Math.sin(l), cl = Math.cos(l), sp = Math.sin(p), cp = Math.cos(p), sg = Math.sin(g), cg = Math.cos(g);
+    return [cl * cp * cg + sl * sp * sg, sl * cp * cg - cl * sp * sg, cl * sp * cg + sl * cp * sg, cl * cp * sg - sl * sp * cg];
+  }
+  function versorMultiply(a, b) {
+    return [
+      a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+      a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
+      a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
+      a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0],
+    ];
+  }
+  function versorRotation(q) {
+    return [
+      Math.atan2(2 * (q[0] * q[1] + q[2] * q[3]), 1 - 2 * (q[1] * q[1] + q[2] * q[2])) * DEG,
+      Math.asin(Math.max(-1, Math.min(1, 2 * (q[0] * q[2] - q[3] * q[1])))) * DEG,
+      Math.atan2(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] * q[2] + q[3] * q[3])) * DEG,
+    ];
+  }
+
+  // dx / dy: screen drag converted to degrees (x right, y down).
+  // Globe views: trackball — the globe turns about the screen's own axes (left-multiplied
+  // quaternion), so it follows the finger at any orientation, pole or view roll.
+  // Flat earth: spin around the pole. Pilot: yaw / pitch of the look direction.
+  function rotateBy(dx, dy) {
+    if (isFlat()) {
+      state.rotate[0] = ((state.rotate[0] + dx + 540) % 360) - 180;
+    } else if (isPilot()) {
+      state.rotate[0] = ((state.rotate[0] + dx + 540) % 360) - 180;
+      state.rotate[1] = Math.max(-90, Math.min(90, state.rotate[1] - dy));
+    } else {
+      state.rotate = versorRotation(versorMultiply(versor([dx, -dy, 0]), versor(state.rotate)));
+    }
     state.dirty = true;
   }
 

@@ -91,7 +91,11 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
     tiles are needed at once;
   - tiles load on demand (max 3 in flight) into a fixed LRU cache of 24 tiles;
     until a tile is there, the global texture is shown (no stalls);
-  - water = white texels, coastline = water/land edge inside the tile;
+  - land/sea from a per-tile 360×360 mask rasterised from the land-50m
+    vectors when the tile loads (`tileLandMask()`; the raster's own white is
+    not a reliable sea mark — Arctic seas are tinted like land); colour and
+    lakes (white inside land) from the raster; coastline = mask edge;
+    ESP: precompute the masks offline (1 bit/texel);
   - cost: on desktop the tile lookup adds ~1 ms to the ~38 ms pilot frame;
   - ESP port: bake the colour boost into the tiles offline, decode with the
     P4 hardware JPEG decoder to RGB565 (360×360×2 B = 253 KB per tile, 24 tiles
@@ -111,7 +115,11 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
   the view moves; still one lookup per night pixel.
   Tiles were cut with `sips` from the Natural Earth TIFF (crop 360-px strips,
     then 360×360 tiles, JPEG quality 78).
-- Dragging pans temporarily; the view glides back after 4 s.
+- Dragging pans temporarily; the view glides back after 4 s. Globe views use
+  a trackball (`rotateBy()`): each drag turns the globe about the screen's own
+  axes by left-multiplying the rotation quaternion (d3 "versor" maths), so it
+  follows the finger at any orientation, near the poles and in the rolled
+  satellite-reference view. Flat earth spins about the pole; pilot yaws/pitches.
 - On-screen menu (`drawMenu()`, `onTap()`): a tap (pointer moved < 6 px) on the
   bottom HUD tab opens a centred "VIEW" panel with
   the five views in the order above (icon + upper-case label, active row highlighted with a white
