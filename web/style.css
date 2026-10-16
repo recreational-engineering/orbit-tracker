@@ -126,5 +126,5 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .label { color: var(--muted); }
 kbd { font: 11px monospace; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; margin-left: 4px; }
 .segmented { display: flex; gap: 0; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
-.segmented button { flex: 1; border-radius: 0; background: #15171a; color: var(--muted); font-weight: 500; }
+.segmented button { flex: 1; border-radius: 0; background: #15171a; color: var(--muted); font-weight: 500; font-size: 12px; line-height: 1.2; padding: 6px 3px; }
 .segmented button.active { background: var(--accent); color: #1a1a1a; font-weight: 600; }

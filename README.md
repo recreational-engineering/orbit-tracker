@@ -26,12 +26,19 @@ display size.
   refreshed once a second; current position refreshed at 10 Hz.
 - Geocentric lon/lat from ECI with a sidereal angle (GMST), see `geoOf()`.
 
-**View modes** (`state.mode`, toggled with M / panel buttons)
-- `orbit` — object fixed at screen centre, flight direction up. The track is
+**View modes** (`state.mode`, toggled with M / panel buttons). Menu order and
+labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
+(`orbit`), PILOT REFERENCE (`pilot`), FLAT EARTH (`flat`).
+- `spin` ("Earth spin") — same content as ground reference, seen from the
+  equatorial plane (perpendicular to the spin axis), north up, the globe
+  turning about the real axis at one turn per `SPIN_PERIOD_S` = 30 s; the
+  surface drifts left → right (eastward rotation). Starts with Munich's
+  longitude centred; redrawn every frame.
+- `orbit` ("Satellite reference") — object fixed at screen centre, flight direction up. The track is
   converted with the *current* GMST for every point (inertial orbit → great
   circle → straight vertical line); the Earth rotates below in real time.
   View roll γ comes from the projected flight direction (`targetRotation()`).
-- `home` — Earth fixed, Munich (48.137°N, 11.575°E) centred, north up. Track
+- `home` ("Ground reference") — Earth fixed, Munich (48.137°N, 11.575°E) centred, north up. Track
   uses each point's own GMST (ground-relative path).
 - `flat` ("Flat earth") — azimuthal equidistant projection centred on the north
   pole, whole Earth in the disc (south pole = rim), Greenwich pointing down,
@@ -39,7 +46,7 @@ display size.
   (r / R)·180°, lon = atan2(x, −y) − λ. Ground-relative track drawn on the
   ground (nothing hidden), 1-min ticks, horizon circle; no sphere lighting
   (rim vignette + glint only), no reticle. Dragging only spins around the pole.
-- `pilot` ("Pilot view") — perspective view from the object looking prograde
+- `pilot` ("Pilot reference") — perspective view from the object looking prograde
   (camera at the ECI position, forward = inertial velocity, up = radial out;
   `updateCamera()`), 55° from centre to screen edge, filling the whole round
   screen. Per pixel: ray–sphere intersection with the Earth (R = 6371 km) →
@@ -94,9 +101,9 @@ display size.
 - Dragging pans temporarily; the view glides back after 4 s.
 - On-screen menu (`drawMenu()`, `onTap()`): a tap (pointer moved < 6 px) on the
   bottom HUD tab opens a centred "VIEW" panel with
-  ORBIT VIEW / GROUND VIEW / FLAT EARTH / PILOT VIEW (icon + upper-case label, active row highlighted with a white
+  the five views in the order above (icon + upper-case label, active row highlighted with a white
   bar). Tapping an option switches mode and closes; tapping outside closes.
-  `home` mode is labelled "Ground view" in the UI.
+  Internal mode keys are unchanged; only the labels changed.
 - Tapping the top HUD tab (time) resets the view: drops any manual pan and
   glides back to the current mode's default centring (`resetView()`).
 

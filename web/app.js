@@ -12,6 +12,7 @@
   const TRACK_STEP_S = 30;
   const MARK_STEP_S = 60;      // 1-minute travel-time marks
   const MARK_MAJOR = 5;        // every 5th mark (whole 5 minutes) is a longer tick
+  const SPIN_PERIOD_S = 30;    // Earth-spin view: one turn on screen per 30 s
   const HOME = { name: 'Munich', lon: 11.575, lat: 48.137, tz: 'Europe/Berlin' };
   const PASS_SEARCH_STEP_S = 20;
   const PASS_SEARCH_SPAN_S = 4 * 3600;
@@ -53,7 +54,8 @@
   // ---------- state ----------
   const state = {
     size: 480,
-    mode: 'orbit',            // 'orbit': object centred, heading up · 'home': fixed view on HOME
+    mode: 'orbit',            // spin | home | orbit | pilot | flat (see MODES)
+    spinT0: 0,                // Earth-spin view: time the spin started (performance.now ms)
     rotate: [-10, -45, 0],    // d3 rotation [λ, φ, γ]: view centre at (-λ, -φ), γ spins the view
     vel: [0, 0],              // pan inertia (deg / frame)
     manualUntil: 0,           // after a pan, hold the user's view until this time (ms)
@@ -506,6 +508,12 @@
   // View orientation the current mode wants.
   function targetRotation() {
     if (state.mode === 'home') return [-HOME.lon, -HOME.lat, 0];
+    if (state.mode === 'spin') {
+      // Seen from the equatorial plane, north up, turning about the real axis: the surface
+      // drifts left → right (eastward rotation), one turn per SPIN_PERIOD_S.
+      const t = (performance.now() - state.spinT0) / 1000;
+      return [(((-HOME.lon + 360 * t / SPIN_PERIOD_S) + 540) % 360) - 180, 0, 0];
+    }
     if (state.mode === 'flat') return [0, -90, 0];
     if (state.mode === 'pilot') return [0, 0, 0];   // no look-around offset
     if (!state.now || !state.ahead) return null;
@@ -1056,7 +1064,7 @@
     // Ground view only: there the grey ticks sit on the grey ground-relative line. In orbit
     // view the grey line is the inertial orbit, which ground-pinned ticks drift away from.
     ctx.lineCap = 'butt';
-    for (const m of state.mode === 'home' ? state.marks : []) {
+    for (const m of state.mode === 'home' || state.mode === 'spin' ? state.marks : []) {
       const a = project3d(m.lon, m.lat, m.alt);
       if (!a.hidden) continue;
       drawTick(a, project3d(m.dir.lon, m.dir.lat, m.dir.alt), m.major, C.tickBehind, 1 - 0.6 * Math.abs(m.t) / TRACK_SPAN_S);
@@ -1482,12 +1490,27 @@
   }
 
   // ---------- on-screen menu ----------
+  // Menu / M-key order. Internal keys stay short; labels are what the user sees.
   const MODES = [
-    { mode: 'orbit', label: 'Orbit view', icon: 'orbit' },
-    { mode: 'home', label: 'Ground view', icon: 'pin' },
+    { mode: 'spin', label: 'Earth spin', icon: 'spin' },
+    { mode: 'home', label: 'Ground reference', icon: 'pin' },
+    { mode: 'orbit', label: 'Satellite reference', icon: 'orbit' },
+    { mode: 'pilot', label: 'Pilot reference', icon: 'pilot' },
     { mode: 'flat', label: 'Flat earth', icon: 'flat' },
-    { mode: 'pilot', label: 'Pilot view', icon: 'pilot' },
   ];
+
+  // Earth-spin icon: globe with its axis and a curved arrow around it.
+  ICONS.spin = (x, y, h) => {
+    const r = h * 0.36;
+    ctx.save();
+    ctx.strokeStyle = '#fff'; ctx.fillStyle = '#fff'; ctx.lineWidth = Math.max(1.2, h * 0.08); ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, y - r * 1.45); ctx.lineTo(x, y + r * 1.45); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(x, y, r * 1.35, r * 0.42, 0, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+    const ax = x - r * 1.2, ay = y + r * 0.22, a = h * 0.14;   // arrowhead at the left end, pointing back
+    ctx.beginPath(); ctx.moveTo(ax - a, ay - a * 0.2); ctx.lineTo(ax + a * 0.6, ay - a); ctx.lineTo(ax + a * 0.3, ay + a * 0.6); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  };
 
   // Pilot-view icon: prograde symbol.
   ICONS.pilot = (x, y, h) => {
@@ -1623,6 +1646,7 @@
 
   function setMode(mode) {
     const wasKind = viewKind(state.mode);
+    if (mode === 'spin' && state.mode !== 'spin') state.spinT0 = performance.now();
     state.mode = mode;
     state.manualUntil = 0;
     projection = isFlat() ? azeq : ortho;
@@ -1707,6 +1731,7 @@
   function frame(ts) {
     if (ts - lastTrack > 1000) { lastTrack = ts; updateTrack(); }
     if (ts - lastNow > 100) { lastNow = ts; updateNow(); state.dirty = true; }
+    if (state.mode === 'spin') state.dirty = true;   // continuous rotation
     if (!drag && (Math.abs(state.vel[0]) > 0.01 || Math.abs(state.vel[1]) > 0.01)) {
       rotateBy(state.vel[0], state.vel[1]);
       state.vel = state.vel.map((v) => v * 0.92);
