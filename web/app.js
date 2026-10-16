@@ -13,6 +13,9 @@
   const MARK_STEP_S = 60;      // 1-minute travel-time marks
   const MARK_MAJOR = 5;        // every 5th mark (whole 5 minutes) is a longer tick
   const SPIN_PERIOD_S = 30;    // Earth-spin view: one turn on screen per 30 s
+  // Orbit-line opacity: the line ahead is solid; the part already flown fades out
+  // linearly until it is gone at −TRACK_SPAN_S. Used for line, ticks and hidden parts.
+  const trackAlpha = (t) => (t >= 0 ? 1 : Math.max(0, 1 + t / TRACK_SPAN_S));
   const HOME = { name: 'Munich', lon: 11.575, lat: 48.137, tz: 'Europe/Berlin' };
   const PASS_SEARCH_STEP_S = 20;
   const PASS_SEARCH_SPAN_S = 4 * 3600;
@@ -27,10 +30,8 @@
     coastRgb: [15, 25, 15],
     border: 'rgba(20, 20, 20, .5)',
     graticule: 'rgba(255, 255, 255, .16)',
-    trackFuture: '#c8102e',
-    trackPast: '#ff6b6b',
-    tick: 'rgba(255, 150, 150, .8)',  // travel-time ticks: fine, muted
-    tickBehind: 'rgba(196, 200, 204, .75)',
+    track: '#c8102e',                 // orbit line and its ticks: one dark, crisp red
+    tickBehind: '#c4c8cc',            // hidden ticks: same grey as the hidden line
     footprint: 'rgba(255, 226, 122, .9)',
     hud: '#4dff7a',                   // pilot HUD green
     hudShadow: 'rgba(0, 0, 0, .65)',
@@ -786,10 +787,10 @@
           const t = (PILOT_NEAR_KM - p.z) / (q.z - p.z), m = { x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t, z: PILOT_NEAR_KM };
           if (p.z < PILOT_NEAR_KM) p = m; else q = m;
         }
-        const t = A.t + (B.t - A.t) * (j + 1) / PILOT_SUBDIV;
-        ctx.globalAlpha = 1 - 0.65 * Math.abs(t) / TRACK_SPAN_S;
-        ctx.strokeStyle = t <= 0 ? C.trackPast : C.trackFuture;
-        ctx.lineWidth = t <= 0 ? s / 300 : s / 200;
+        const t = A.t + (B.t - A.t) * (j + 0.5) / PILOT_SUBDIV;
+        ctx.globalAlpha = trackAlpha(t);
+        ctx.strokeStyle = C.track;
+        ctx.lineWidth = s / 200;
         const [x1, y1] = scr(p), [x2, y2] = scr(q);
         ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
       }
@@ -1026,13 +1027,11 @@
     ctx.lineCap = 'round';
     for (let i = 1; i < pts.length; i++) {
       const a = pts[i - 1], b = pts[i];
-      const past = b.t <= 0;
-      const fade = 1 - 0.65 * (Math.abs(b.t) / TRACK_SPAN_S);
       // Behind the Earth: not drawn here; drawBehindEarth() prints it grey on the surface.
       if (a.hidden || b.hidden || !a.inView || !b.inView) continue;
-      ctx.globalAlpha = fade;
-      ctx.strokeStyle = past ? C.trackPast : C.trackFuture;
-      ctx.lineWidth = past ? s / 300 : s / 200;
+      ctx.globalAlpha = trackAlpha((a.t + b.t) / 2);
+      ctx.strokeStyle = C.track;
+      ctx.lineWidth = s / 200;
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
     ctx.restore();
@@ -1054,8 +1053,8 @@
       const g = geoOf(p.r, frameGmst(p));
       const cur = { t: p.t, ...project3d(g.lon, g.lat, g.alt) };
       if (prev && (prev.hidden || cur.hidden) && prev.inView && cur.inView) {
-        ctx.globalAlpha = 1 - 0.6 * Math.abs(cur.t) / TRACK_SPAN_S;
-        ctx.lineWidth = cur.t <= 0 ? s / 340 : s / 260;
+        ctx.globalAlpha = trackAlpha((prev.t + cur.t) / 2);
+        ctx.lineWidth = s / 260;
         ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(cur.x, cur.y); ctx.stroke();
       }
       prev = cur;
@@ -1066,7 +1065,7 @@
     for (const m of state.marks) {
       const [a, b] = markPoints(m);
       if (!a.hidden) continue;
-      drawTick(a, b, m.major, C.tickBehind, 1 - 0.6 * Math.abs(m.t) / TRACK_SPAN_S);
+      drawTick(a, b, m.major, C.tickBehind, trackAlpha(m.t));
     }
     ctx.lineCap = 'round';
 
@@ -1140,7 +1139,7 @@
     for (const m of state.marks) {
       const [p, q] = markPoints(m);
       if (p.hidden || !p.inView) continue;   // hidden ones: grey, from drawBehindEarth()
-      drawTick(p, q, m.major, C.tick, 1 - 0.6 * Math.abs(m.t) / TRACK_SPAN_S);
+      drawTick(p, q, m.major, C.track, trackAlpha(m.t));
     }
     ctx.restore();
   }

@@ -137,7 +137,10 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
    display size (ESP: two 1-byte lookup tables). No painted-on gradients or
    glint, so the night side gets no halo. Flat earth: rim vignette + glint only.
 6. Centre reticle.
-7. Track: future solid red, past thinner light red, fading with |Δt|. Points are
+7. Track: one dark crisp red #c8102e, width s/200, for the whole visible line.
+   Opacity `trackAlpha(t)`: 1 for the part ahead; the part already flown fades
+   linearly to 0 at −60 min. Same rule for the ticks, the grey hidden line and
+   hidden ticks, and the pilot-reference line. Points are
    lifted by altitude (radius × (1 + h/6371)); hidden = behind the Earth disk
    (`project3d()`). Hidden parts are NOT drawn through the globe.
 7a. Behind-the-Earth display (`drawBehindEarth()`, globe views only): hidden
@@ -151,8 +154,8 @@ labels: EARTH SPIN (`spin`), GROUND REFERENCE (`home`), SATELLITE REFERENCE
    sit on it: ground-relative in earth spin / ground reference / flat earth,
    inertial in satellite reference (there they slide down the vertical line and
    pass under the fixed object once a minute). Fine 1-px ruler ticks across the
-   line: half length s/170, every 5th minute s/95 and slightly heavier; muted
-   rgba(255,150,150,.8), fading with |Δt|; hidden ticks grey on the grey line.
+   line: half length s/170, every 5th minute s/95 and slightly heavier; exactly
+   the line red with the same opacity rule; hidden ticks grey on the grey line.
    Not shown in pilot reference.
 8. Object: simplified upper stage (nozzle, aft dome, white tank, blue ring,
    payload adapter, gold payload) from lit frustums, nose along the projected
