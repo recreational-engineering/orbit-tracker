@@ -1105,8 +1105,8 @@
   // (the object's horizon, solid, with a compass rose); the inner ones dashed. Printed on the surface, under
   // the orbit line.
   const ELEV_RINGS = [0, 10, 20];
-  const ELEV_LABEL_AZ = { 10: 225, 20: 250 };   // label positions, between the cross arms
-  const ROSE_LABELS = { 0: 'N', 30: '3', 60: '6', 90: 'E', 120: '12', 150: '15', 180: 'S', 210: '21', 240: '24', 270: 'W', 300: '30', 330: '33' };
+  const ELEV_LABEL_AZ = { 10: 270, 20: 90 };   // ring labels on the W / E arms (the orbit usually runs N–S)
+  const ROSE_LABELS = { 0: 'N', 90: 'E', 180: 'S', 270: 'W' };
 
   // Ring of ground radius `radiusDeg` around (lon, lat) as a screen polyline, broken where it
   // is hidden or inside one of the `gaps` boxes ({x, y, hw, hh}) kept free for labels.
@@ -1115,6 +1115,20 @@
     ctx.beginPath();
     for (let az = 0; az <= 360; az += 2) {
       const [lo, la] = destination(lon, lat, az, radiusDeg);
+      const q = project3d(lo, la, 0);
+      const ok = q.front && q.inView && !gaps.some((b) => Math.abs(q.x - b.x) < b.hw && Math.abs(q.y - b.y) < b.hh);
+      if (ok && pen) ctx.lineTo(q.x, q.y); else if (ok) ctx.moveTo(q.x, q.y);
+      pen = ok;
+    }
+    ctx.stroke();
+  }
+
+  // Straight ground line from the centre out along azimuth `az`, broken at the label gaps.
+  function strokeArm(lon, lat, az, lenDeg, gaps) {
+    let pen = false;
+    ctx.beginPath();
+    for (let i = 0; i <= 60; i++) {
+      const [lo, la] = destination(lon, lat, az, lenDeg * i / 60);
       const q = project3d(lo, la, 0);
       const ok = q.front && q.inView && !gaps.some((b) => Math.abs(q.x - b.x) < b.hw && Math.abs(q.y - b.y) < b.hh);
       if (ok && pen) ctx.lineTo(q.x, q.y); else if (ok) ctx.moveTo(q.x, q.y);
@@ -1141,7 +1155,7 @@
       const [lo, la] = destination(g.lon, g.lat, ELEV_LABEL_AZ[e], ringDeg(e));
       const q = project3d(lo, la, 0);
       if (!q.front || !q.inView) continue;
-      if (!apex.hidden && Math.hypot(apex.x - q.x, apex.y - q.y) < s * 0.06) continue;   // under the object
+      if (!apex.hidden && Math.hypot(apex.x - q.x, apex.y - q.y) < s * 0.03) continue;   // under the object
       const hw = ctx.measureText(`${e}°`).width / 2 + s * 0.008, hh = fs * 0.6;
       if (labels.some((b) => Math.abs(b.x - q.x) < b.hw + hw && Math.abs(b.y - q.y) < b.hh + hh)) continue;
       labels.push({ text: `${e}°`, x: q.x, y: q.y, hw, hh });
@@ -1156,20 +1170,15 @@
     ctx.setLineDash([]);
     for (const L of labels) hudText(L.text, L.x, L.y, fs, 600, false, C.footprint);
 
-    // Thin cross inside the horizon ring, linking N–S and E–W through the sub-satellite point.
+    // Thin cross inside the horizon ring, linking N–S and E–W through the sub-satellite
+    // point; broken where the ring labels sit on the W / E arms.
     ctx.strokeStyle = C.footprint;
-    ctx.lineWidth = Math.max(1, s / 480);
-    ctx.beginPath();
-    for (const az of [0, 90]) {
-      path({ type: 'LineString', coordinates: [
-        destination(g.lon, g.lat, az, horizonDeg), [g.lon, g.lat], destination(g.lon, g.lat, az + 180, horizonDeg),
-      ] });
-    }
-    ctx.stroke();
+    ctx.lineWidth = Math.max(1.4, s / 320);
+    for (const az of [0, 90, 180, 270]) strokeArm(g.lon, g.lat, az, horizonDeg, labels);
 
     // Compass rose outside the horizon ring (Earth frame, azimuth from the sub-satellite
-    // point): ticks every 10°, long every 30°, nav-display labels (N 3 6 E 12 …) placed in
-    // screen space beyond the tick ends so they never touch the ticks.
+    // point): ticks every 10°, long every 30°, and N / E / S / W placed in screen space
+    // beyond the tick ends so they never touch the ticks.
     const pxDeg = (isFlat() ? 180 : DEG) / discRadius();
     ctx.lineWidth = Math.max(1, s / 360);
     ctx.beginPath();
@@ -1181,12 +1190,12 @@
       const a = project3d(lo1, la1, 0), b = project3d(lo2, la2, 0);
       if (!a.front || !a.inView || !b.front) continue;
       ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
-      if (major) ends.push({ az, a, b });
+      if (az % 90 === 0) ends.push({ az, a, b });
     }
     ctx.stroke();
     for (const { az, a, b } of ends) {
       const dx = b.x - a.x, dy = b.y - a.y, n = Math.hypot(dx, dy) || 1;
-      const txt = ROSE_LABELS[az], big = az % 90 === 0, lfs = big ? fs : Math.round(fs * 0.82);
+      const txt = ROSE_LABELS[az], lfs = fs;
       ctx.font = `600 ${lfs}px ${HUD_FONT}`;
       const off = Math.max(ctx.measureText(txt).width, lfs) * 0.6 + s * 0.006;
       hudText(txt, b.x + dx / n * off, b.y + dy / n * off, lfs, 600, true, C.footprint);
