@@ -612,15 +612,20 @@
     ctx.fillStyle = face;
     ctx.fillRect(0, 0, s, s);
 
-    // Cast shadow, offset down-right, so the globe floats above the face.
+    // The globe stands out of the face: a soft cast shadow away from the lamp (down-right)
+    // and a tight contact shadow where the sphere meets the window.
     ctx.save();
-    const sh = ctx.createRadialGradient(cx + r * 0.05, cy + r * 0.07, r * 0.9, cx + r * 0.05, cy + r * 0.07, r * 1.12);
-    sh.addColorStop(0, 'rgba(0,0,0,.75)');
+    const ox = -LIGHT_DIR[0] * r * 0.11, oy = LIGHT_DIR[1] * r * 0.11;
+    const sh = ctx.createRadialGradient(cx + ox, cy + oy, r * 0.85, cx + ox, cy + oy, r * 1.16);
+    sh.addColorStop(0, 'rgba(0,0,0,.7)');
     sh.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = sh;
-    ctx.beginPath();
-    ctx.arc(cx + r * 0.05, cy + r * 0.07, r * 1.12, 0, 2 * Math.PI);
-    ctx.fill();
+    ctx.beginPath(); ctx.arc(cx + ox, cy + oy, r * 1.16, 0, 2 * Math.PI); ctx.fill();
+    const contact = ctx.createRadialGradient(cx, cy, r * 0.97, cx, cy, r * 1.045);
+    contact.addColorStop(0, 'rgba(0,0,0,.85)');
+    contact.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = contact;
+    ctx.beginPath(); ctx.arc(cx, cy, r * 1.045, 0, 2 * Math.PI); ctx.fill();
     ctx.restore();
 
     // Sea, terrain, coastline, night side and city lights: one per-pixel pass.
@@ -809,33 +814,51 @@
   }
 
   // Soviet-instrument style lighting: lit from upper left, dark limb, glass glint.
+  // Physical sphere lighting, like a real globe behind the instrument window: Lambert
+  // diffuse from a lamp at the upper left/front, darkening toward the limb all round, and a
+  // small glossy highlight. It depends only on the pixel's place on the disc, never on the
+  // globe's rotation, so it is computed once per display size into two layers:
+  //   shade    – multiplied over the finished globe (map, lines, everything printed on it)
+  //   specular – added on top
+  // ESP: the same two layers as per-pixel lookup tables (one byte each).
+  const LIGHT_DIR = (() => { const v = [-0.5, 0.6, 0.62], n = Math.hypot(...v); return v.map((x) => x / n); })();
+  const SPHERE = { AMB: 0.16, DIF: 1.25, RIM: 0.42, SPEC: 0.42, SPEC_N: 70, SHEEN: 0.05, SHEEN_N: 6 };
+  let sphereLight = null;
+  function sphereLayers(s, r, cx, cy) {
+    if (sphereLight && sphereLight.s === s && sphereLight.r === r) return sphereLight;
+    const mk = () => { const c = document.createElement('canvas'); c.width = c.height = s; return c; };
+    const shade = mk(), spec = mk();
+    const si = shade.getContext('2d').createImageData(s, s), pi = spec.getContext('2d').createImageData(s, s);
+    const [lx, ly, lz] = LIGHT_DIR;
+    const hn = Math.hypot(lx, ly, lz + 1), hx = lx / hn, hy = ly / hn, hz = (lz + 1) / hn;   // half vector, viewer at +z
+    for (let py = 0; py < s; py++) {
+      const Y = (cy - py - 0.5) / r;
+      for (let px = 0; px < s; px++) {
+        const X = (px + 0.5 - cx) / r, d = X * X + Y * Y, i = (py * s + px) * 4;
+        si.data[i + 3] = pi.data[i + 3] = 255;
+        if (d > 1) { si.data[i] = si.data[i + 1] = si.data[i + 2] = 255; continue; }
+        const Z = Math.sqrt(1 - d);
+        const ndl = Math.max(0, X * lx + Y * ly + Z * lz);
+        const k = (SPHERE.AMB + SPHERE.DIF * ndl) * (1 - SPHERE.RIM + SPHERE.RIM * Math.sqrt(Z));
+        si.data[i] = si.data[i + 1] = si.data[i + 2] = 255 * Math.min(1, k);
+        const ndh = Math.max(0, X * hx + Y * hy + Z * hz);
+        const sp = SPHERE.SPEC * Math.pow(ndh, SPHERE.SPEC_N) + SPHERE.SHEEN * Math.pow(ndh, SPHERE.SHEEN_N);
+        pi.data[i] = pi.data[i + 1] = pi.data[i + 2] = 255 * Math.min(1, sp);
+      }
+    }
+    shade.getContext('2d').putImageData(si, 0, 0);
+    spec.getContext('2d').putImageData(pi, 0, 0);
+    sphereLight = { s, r, shade, spec };
+    return sphereLight;
+  }
+
   function drawGlobeShading(cx, cy, r) {
-    const lx = cx - r * 0.35, ly = cy - r * 0.4;
-    const light = ctx.createRadialGradient(lx, ly, 0, lx, ly, r * 1.55);
-    light.addColorStop(0, 'rgba(255,255,240,.28)');
-    light.addColorStop(0.35, 'rgba(255,255,240,0)');
-    light.addColorStop(0.7, 'rgba(0,0,0,.18)');
-    light.addColorStop(1, 'rgba(0,0,0,.7)');
-    ctx.fillStyle = light;
-    ctx.fillRect(cx - r, cy - r, 2 * r, 2 * r);
-
-    const limb = ctx.createRadialGradient(cx, cy, r * 0.72, cx, cy, r);
-    limb.addColorStop(0, 'rgba(0,0,0,0)');
-    limb.addColorStop(1, 'rgba(0,0,0,.45)');
-    ctx.fillStyle = limb;
-    ctx.fillRect(cx - r, cy - r, 2 * r, 2 * r);
-
-    // Soft glass reflection.
-    ctx.save();
-    ctx.translate(cx - r * 0.38, cy - r * 0.48);
-    ctx.rotate(-0.6);
-    const glint = ctx.createRadialGradient(0, 0, 0, 0, 0, r * 0.32);
-    glint.addColorStop(0, 'rgba(255,255,255,.35)');
-    glint.addColorStop(1, 'rgba(255,255,255,0)');
-    ctx.scale(1, 0.55);
-    ctx.fillStyle = glint;
-    ctx.beginPath(); ctx.arc(0, 0, r * 0.32, 0, 2 * Math.PI); ctx.fill();
-    ctx.restore();
+    const L = sphereLayers(state.size, r, cx, cy);
+    ctx.globalCompositeOperation = 'multiply';
+    ctx.drawImage(L.shade, 0, 0);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.drawImage(L.spec, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
   }
 
   // Home location marker: blue dot with white rim, like an ownship symbol on a chart.

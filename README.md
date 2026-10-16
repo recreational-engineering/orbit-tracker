@@ -89,7 +89,9 @@ display size.
   glides back to the current mode's default centring (`resetView()`).
 
 **Rendering layers** (back to front, `draw()`)
-1. Dark instrument face + offset radial drop shadow around the globe.
+1. Dark instrument face; soft cast shadow offset away from the lamp (down-right,
+   0.11·r) plus a tight contact shadow ring (0.97…1.045·r) so the globe stands
+   out of the window.
 2. Globe radius = 0.43 × display size, orthographic projection, rotation [λ, φ, γ].
 3. One per-pixel pass (`renderGlobePixels()`, inverse orthographic lookup):
    - land/sea from a land mask: `land-50m.json` rasterised once to a
@@ -107,7 +109,14 @@ display size.
 4b. Both views: the object's horizon on the ground — small circle around
    the sub-satellite point with radius acos(R / (R + h)), thin yellow line
    (`drawFootprint()`).
-5. Shading: radial light from upper-left, limb darkening, elliptical glass glint.
+5. Sphere lighting (globe views; `sphereLayers()` / `drawGlobeShading()`),
+   applied after everything printed on the globe: per disc pixel normal
+   N = (x, y, √(1−x²−y²)), lamp L = norm(−0.5, 0.6, 0.62);
+   shade = min(1, (0.16 + 1.25·max(0, N·L)) · (0.58 + 0.42·√Nz)) multiplied,
+   specular = 0.42·(N·H)⁷⁰ + 0.05·(N·H)⁶ added (H = half vector to the viewer).
+   Both depend only on the screen position, so they are computed once per
+   display size (ESP: two 1-byte lookup tables). No painted-on gradients or
+   glint, so the night side gets no halo. Flat earth: rim vignette + glint only.
 6. Centre reticle.
 7. Track: future solid red, past thinner light red, fading with |Δt|. Points are
    lifted by altitude (radius × (1 + h/6371)); hidden = behind the Earth disk
