@@ -7,6 +7,8 @@
  *   G x0 y0 x1 y1 ms  simulated finger drag (testing without touching the panel)
  *   K x y             simulated tap
  *   P                 print frame statistics since the last P (and stop the periodic ones)
+ *
+ * Standby: 22:00-08:00 local time the backlight is off; a touch wakes it for 5 minutes.
  */
 #include <stdio.h>
 #include <math.h>
@@ -35,6 +37,22 @@
 static const char *TAG = "orbit";
 
 #define FRAME_HZ 30
+
+// Standby: from 22:00 to 08:00 local time the backlight is switched off (its LED driver gets
+// no on-time at all, so no light leaks as a black frame would) and nothing is rendered; the
+// touch controller stays on. A touch wakes the display, which goes dark again after
+// STANDBY_IDLE_S without a touch.
+#define STANDBY_FROM_H 22
+#define STANDBY_TO_H 8
+#define STANDBY_IDLE_S 300
+
+static bool night_hours(void)
+{
+    time_t t = time(NULL);
+    struct tm lt;
+    localtime_r(&t, &lt);   // TZ = Europe/Berlin
+    return lt.tm_hour >= STANDBY_FROM_H || lt.tm_hour < STANDBY_TO_H;
+}
 
 static esp_lcd_panel_handle_t panel;
 static esp_lcd_touch_handle_t touch;
@@ -250,7 +268,33 @@ void app_main(void)
     scene_timing_t sum = {0}, tm;
     int64_t last = esp_timer_get_time(), stats_at = last;
     bool was_pressed = false;
+    bool dark = false;          // standby: backlight off, no rendering
+    bool swallow = false;       // the touch that woke the display is not passed on as a tap
+    int64_t last_touch_ms = 0;
     for (;;) {
+        if (dark) {
+            // Poll the touch controller at 20 Hz; wake on a touch (real or simulated) or at
+            // the end of the night hours.
+            uint8_t cnt = 0;
+            if (touch) {
+                esp_lcd_touch_point_data_t pt;
+                esp_lcd_touch_read_data(touch);
+                esp_lcd_touch_get_data(touch, &pt, &cnt, 1);
+            }
+            bool touched = cnt > 0 || sim.pending;
+            if (!touched && night_hours()) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+            dark = false;
+            swallow = cnt > 0;
+            sim.pending = false;
+            was_pressed = false;
+            last = esp_timer_get_time();
+            last_touch_ms = last / 1000;
+            first = true;   // backlight on once a fresh frame is on the panel
+            ESP_LOGI(TAG, "standby: display on (%s)", touched ? "touch" : "morning");
+        }
         int64_t now = esp_timer_get_time();
         float dt = (now - last) / 1e6f;
         last = now;
@@ -276,9 +320,23 @@ void app_main(void)
             uint8_t cnt = 0;
             esp_lcd_touch_read_data(touch);
             esp_lcd_touch_get_data(touch, &pt, &cnt, 1);
-            if (cnt) scene_touch(true, pt.x, pt.y, ms);
-            else if (was_pressed) scene_touch(false, 0, 0, ms);
-            was_pressed = cnt > 0;
+            if (cnt) last_touch_ms = ms;
+            if (swallow) {
+                swallow = cnt > 0;   // until the waking finger is lifted
+            } else {
+                if (cnt) scene_touch(true, pt.x, pt.y, ms);
+                else if (was_pressed) scene_touch(false, 0, 0, ms);
+                was_pressed = cnt > 0;
+            }
+        }
+        if (sim_run.active) last_touch_ms = ms;
+        if (night_hours() && ms - last_touch_ms > STANDBY_IDLE_S * 1000LL) {
+            bsp_display_brightness_set(0);
+            if (was_pressed) scene_touch(false, 0, 0, ms);
+            was_pressed = false;
+            dark = true;
+            ESP_LOGI(TAG, "standby: display off");
+            continue;
         }
         if (clock_changed) { clock_changed = false; scene_clock_changed(now_unix()); }
         scene_update(now_unix(), dt, ms);

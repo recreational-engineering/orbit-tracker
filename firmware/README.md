@@ -34,6 +34,13 @@ ESP-IDF v6.1. `gen_assets.py` needs Pillow and numpy.
     idf.py -p /dev/cu.usbmodem* flash
     tools/flash_tiles.sh                   # once (and after the tile layout changes): writes tiles.bin
 
+## Standby
+
+From 22:00 to 08:00 (Munich time) the display goes dark after 5 minutes without a touch: the
+backlight is switched off (no light, unlike a black frame) and nothing is rendered, while the
+touch controller keeps polling. A touch wakes it (that touch is not taken as a tap) for another
+5 minutes; at 08:00 it comes on by itself. The console logs `standby: display off/on`.
+
 ## Clock and console
 
 The board has no network time yet. It starts at the time the assets were generated;
