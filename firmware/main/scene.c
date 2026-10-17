@@ -1619,6 +1619,7 @@ static void frame_strips(int part, const void *vctx)
 {
     const frame_job_t *j = vctx;
     uint16_t *sb = strip_buf[part];
+    if (!sb) return;   // out of internal RAM at start-up: skip rather than write through NULL
     for (int k = part; k < DL_NSTRIPS; k += 2) {
         int y0 = k * DL_STRIP_H, y1 = y0 + DL_STRIP_H < S ? y0 + DL_STRIP_H : S;
         uint16_t *fbv = sb - y0 * S;   // frame coordinates for this strip's rows

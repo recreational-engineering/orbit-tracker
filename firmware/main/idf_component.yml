@@ -1,2 +1,5 @@
 dependencies:
   waveshare/esp32_p4_wifi6_touch_lcd_xc: "3.0.1"
+  # Wi-Fi on the ESP32-P4 runs on the on-board ESP32-C6 over ESP-Hosted; esp_wifi_remote
+  # presents the normal esp_wifi API and pulls in esp_hosted for the transport.
+  espressif/esp_wifi_remote: "*"

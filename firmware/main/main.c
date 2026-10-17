@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <time.h>
 #include "bsp/esp-bsp.h"
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
@@ -27,6 +28,8 @@
 #include "gfx.h"
 #include "scene.h"
 #include "tiles.h"
+#include "net.h"
+#include "nvs_flash.h"
 #include "generated/elements.h"
 
 static const char *TAG = "orbit";
@@ -133,6 +136,23 @@ static void touch_init(void)
     }
 }
 
+// Network updates: once at boot, then once a day at 00:00 UTC while the device keeps running.
+// The radio is off except during a sync (net_sync brings it up and takes it down).
+static void net_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(1500));            // let the UI come up first
+    net_sync((net_sync_t){.time = true, .elements = true});
+    for (;;) {
+        time_t now = time(NULL);
+        struct tm tm;
+        gmtime_r(&now, &tm);
+        // Seconds until the next 00:00 UTC.
+        int secs = ((23 - tm.tm_hour) * 60 + (59 - tm.tm_min)) * 60 + (60 - tm.tm_sec);
+        vTaskDelay(pdMS_TO_TICKS((secs + 1) * 1000));
+        net_sync((net_sync_t){.time = true, .elements = true});
+    }
+}
+
 static void console_task(void *arg)
 {
     char line[64];
@@ -155,6 +175,8 @@ static void console_task(void *arg)
             settimeofday(&tv, NULL);
             clock_changed = true;
             ESP_LOGI(TAG, "TIME set to %.3f", t);
+        } else if (cmd[0] == 'N') {
+            if (!net_busy()) xTaskCreatePinnedToCore(net_sync_now, "net-now", 12288, NULL, 4, NULL, 0);
         } else if (cmd[0] == 'G' || cmd[0] == 'K') {
             int v[5] = {0};
             int n = sscanf(cmd + 1, "%d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4]);
@@ -193,6 +215,12 @@ void app_main(void)
     ESP_ERROR_CHECK(uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 1024, 64 * 1024, 0, NULL, 0));
     uart_vfs_dev_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
 
+    esp_err_t nv = nvs_flash_init();
+    if (nv == ESP_ERR_NVS_NO_FREE_PAGES || nv == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+
     // No RTC battery or network time yet: never run earlier than the asset build.
     if (now_unix() < ASSETS_GEN_UNIX) {
         struct timeval tv = {.tv_sec = ASSETS_GEN_UNIX};
@@ -212,6 +240,8 @@ void app_main(void)
     vTaskPrioritySet(NULL, 5);   // frame loop above the background globe redraws
     scene_init();
     xTaskCreatePinnedToCore(console_task, "console", 4096, NULL, 5, NULL, 0);
+    net_init();
+    xTaskCreatePinnedToCore(net_task, "net", 12288, NULL, 4, NULL, 0);
 
     bool first = true;
     int frames = 0, half_frames = 0;

@@ -3,6 +3,7 @@
  * search) run once a second in a low-priority task and are published as snapshots. */
 #pragma once
 #include <stdbool.h>
+#include "orbit.h"
 
 #define EARTH_R_KM 6371.0
 #define TRACK_SPAN_S 3600
@@ -38,6 +39,9 @@ typedef struct {
 } snapshot_t;
 
 void model_init(void);
+// Replace the orbital elements at runtime (from a network refresh) and persist them to NVS.
+// Ignored unless the elements are for this device's compiled-in NORAD id. Thread-safe.
+bool model_set_omm(const omm_t *omm);
 // Wake the worker to compute a snapshot for time t (no-op while one is in progress).
 void model_request(double t);
 // Latest published snapshot (stable for at least a second after it is returned).

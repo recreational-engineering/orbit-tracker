@@ -49,6 +49,30 @@ The tools find the board's CH343 port by its USB id. Console commands:
 | `S` | dump the frame on screen (`tools/screenshot.py out.png --round`) |
 | `K x y` / `G x0 y0 x1 y1 ms` | simulated tap / drag |
 | `F` | flash monitor on/off: logs frames where part of the screen jumps for one frame |
+| `N` | network sync now (time + orbital elements) |
+
+## Network (time and orbital elements)
+
+Wi-Fi runs on the board's on-board ESP32-C6 co-processor via ESP-Hosted (`esp_wifi_remote`).
+The device joins only to read two things and then takes the radio back down:
+
+- the current time, from NTP (`pool.ntp.org`);
+- fresh orbital elements for the compiled-in NORAD id, from CelesTrak, applied live and saved
+  to NVS so they survive a reboot (loaded at the next boot before the first sync).
+
+It syncs once at boot and then once a day at 00:00 UTC (and on the `N` command). Between syncs
+the radio is off. It joins as a station only (never an access point), presents one nondescript
+DHCP host name (an office-printer style name), and makes no other connection — there is no
+server, no discovery service, and no path that sends device data anywhere.
+
+Credentials and the host name live in `main/net_secret.h` (git-ignored; copy
+`main/net_secret.h.example`). The element fetch uses plain HTTP: the response is public orbital
+data and the request reveals only the public NORAD id (which TLS would expose via SNI anyway).
+TLS does not currently complete over this board's co-processor firmware; see the note below.
+
+> The C6 reports an ESP-Hosted firmware version mismatch (`coprocessor=0.0.0` vs host 3.0.9).
+> Basic traffic (DNS, TCP, UDP/NTP, HTTP) works, but the TLS handshake does not complete and the
+> boot auto-init can occasionally fault. Updating the C6 slave firmware to match should fix both.
 
 Test tools: `tools/drive.py` (scripted taps, drags and screenshots), `tools/perf_test.py`
 (frame rate per view, still and panning; `--time` for a fixed scene),
@@ -63,10 +87,11 @@ interrupts) and the display interrupts are cache-safe (`CONFIG_LCD_DSI_ISR_CACHE
 
 ## Rendering and performance
 
-Each frame is recorded into a display list on both cores, then drawn in 40-row strips
+Each frame is recorded into a display list on both cores, then drawn in 20-row strips
 of internal RAM (globe pixels, then the vector layers), each core taking every other
 strip, and copied to one of three frame buffers; the panel swaps at the end of a
-refresh, so frames never tear and the loop never waits for the panel.
+refresh, so frames never tear and the loop never waits for the panel. (The strips are
+kept small so the renderer's internal RAM coexists with the Wi-Fi/ESP-Hosted stack.)
 
 - Earth spin is drawn at full resolution every frame (the globe turns all the time).
 - Ground, satellite reference and flat earth show a full-resolution globe rendered by a

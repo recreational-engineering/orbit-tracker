@@ -6,7 +6,9 @@
 #include <stdbool.h>
 #include "gfx.h"
 
-#define DL_STRIP_H 40
+// 20-row strips keep the per-core internal-RAM scratch small (two buffers of 20*720*2 B), so the
+// renderer coexists with the Wi-Fi/ESP-Hosted stack, which reserves internal RAM at start-up.
+#define DL_STRIP_H 20
 #define DL_NSTRIPS ((GFX_H + DL_STRIP_H - 1) / DL_STRIP_H)
 
 void dl_init(void);

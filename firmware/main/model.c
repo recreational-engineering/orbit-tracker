@@ -1,8 +1,11 @@
 #include <math.h>
 #include <string.h>
+#include <time.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs.h"
 #include "model.h"
 #include "orbit.h"
 #include "generated/elements.h"
@@ -18,11 +21,16 @@ static volatile double requested_t;
 static volatile bool busy;
 static TaskHandle_t worker;
 static double home_ecf[3];
+// Serialises SGP4 state (re-init vs. the per-call propagation on the frame loop and the worker).
+static SemaphoreHandle_t orbit_lock;
 
 eci_t model_propagate(double t)
 {
     eci_t e = {.ok = false};
-    if (orbit_propagate(t, e.r, e.v)) { e.gmst = orbit_gmst(t); e.ok = true; }
+    xSemaphoreTake(orbit_lock, portMAX_DELAY);
+    bool ok = orbit_propagate(t, e.r, e.v);
+    xSemaphoreGive(orbit_lock);
+    if (ok) { e.gmst = orbit_gmst(t); e.ok = true; }
     return e;
 }
 
@@ -149,7 +157,9 @@ static void compute(snapshot_t *s, double t)
     }
     s->next_pass = find_next_pass(t);
     double r[3], v[3];
+    xSemaphoreTake(orbit_lock, portMAX_DELAY);
     s->valid = orbit_propagate(t, r, v);
+    xSemaphoreGive(orbit_lock);
     if (s->valid) {
         eci_to_geodetic(r, orbit_gmst(t), &s->lat, &s->lon, &s->alt);
         s->vel = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
@@ -180,17 +190,54 @@ const snapshot_t *model_snapshot(void)
     return published < 0 ? NULL : &snaps[published];
 }
 
+#define OMM_NVS_NS "orbit"
+#define OMM_NVS_KEY "omm"
+
+// Load elements saved by a previous network refresh (same NORAD id only). Returns false if
+// none, invalid, or for a different object, so the compiled-in elements are used instead.
+static bool load_saved_omm(omm_t *out)
+{
+    nvs_handle_t h;
+    if (nvs_open(OMM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    size_t n = sizeof *out;
+    bool ok = nvs_get_blob(h, OMM_NVS_KEY, out, &n) == ESP_OK && n == sizeof *out &&
+              out->norad_cat_id == OMM_NORAD_CAT_ID && out->mean_motion > 0;
+    nvs_close(h);
+    return ok;
+}
+
+bool model_set_omm(const omm_t *omm)
+{
+    if (omm->norad_cat_id != OMM_NORAD_CAT_ID || !(omm->mean_motion > 0)) return false;   // not our object
+    xSemaphoreTake(orbit_lock, portMAX_DELAY);
+    bool ok = orbit_init(omm);
+    xSemaphoreGive(orbit_lock);
+    if (!ok) return false;
+    nvs_handle_t h;
+    if (nvs_open(OMM_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_blob(h, OMM_NVS_KEY, omm, sizeof *omm);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    model_request((double)time(NULL));   // recompute the track with the new elements
+    ESP_LOGI(TAG, "elements updated (epoch %.0f UTC) and saved", omm->epoch_unix);
+    return true;
+}
+
 void model_init(void)
 {
-    const omm_t omm = {
+    orbit_lock = xSemaphoreCreateMutex();
+    omm_t omm = {
         .epoch_unix = OMM_EPOCH_UNIX, .mean_motion = OMM_MEAN_MOTION, .eccentricity = OMM_ECCENTRICITY,
         .inclination = OMM_INCLINATION, .ra_of_asc_node = OMM_RA_OF_ASC_NODE,
         .arg_of_pericenter = OMM_ARG_OF_PERICENTER, .mean_anomaly = OMM_MEAN_ANOMALY, .bstar = OMM_BSTAR,
         .mean_motion_dot = OMM_MEAN_MOTION_DOT, .mean_motion_ddot = OMM_MEAN_MOTION_DDOT,
         .norad_cat_id = OMM_NORAD_CAT_ID,
     };
+    bool saved = load_saved_omm(&omm);
     if (!orbit_init(&omm)) ESP_LOGE(TAG, "SGP4 init failed for %d", OMM_NORAD_CAT_ID);
-    ESP_LOGI(TAG, "%s (%s), elements epoch %s UTC", OMM_OBJECT_NAME, OMM_OBJECT_ID, OMM_EPOCH_STR);
+    ESP_LOGI(TAG, "%s (%s), elements epoch %s%s", OMM_OBJECT_NAME, OMM_OBJECT_ID,
+             saved ? "from saved refresh" : OMM_EPOCH_STR, saved ? "" : " UTC");
     geodetic_to_ecf(HOME_LON / DEG, HOME_LAT / DEG, 0, home_ecf);
     // Below the frame loop and the globe renders; it needs ~1 s of slack per second at most.
     xTaskCreatePinnedToCore(worker_task, "orbit", 6144, NULL, 1, &worker, 1);
