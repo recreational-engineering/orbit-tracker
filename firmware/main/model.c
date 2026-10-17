@@ -81,6 +81,11 @@ static void eci_to_geodetic(const double r[3], double gmst, double *lat, double 
     *h = R2 / cos(la) - WGS_A * C;
 }
 
+void model_geodetic(const eci_t *e, double *lat, double *lon, double *alt)
+{
+    eci_to_geodetic(e->r, e->gmst, lat, lon, alt);
+}
+
 double model_range_home(const eci_t *e)
 {
     double c = cos(e->gmst), s = sin(e->gmst);

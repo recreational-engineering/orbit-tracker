@@ -331,8 +331,10 @@ void app_main(void)
                      "half-res %d/%d | full-res renders %d x %.0f ms",
                      scene_mode_name(), frames / secs, worst_gap_ms, sum.total_ms / frames, worst_ms, sum.base_ms / frames, sum.lines_ms / frames,
                      sum.overlay_ms / frames, half_frames, frames, redraws, redraw_ms);
-            ESP_LOGI(TAG, "PANEL refresh max %.1f ms, late refreshes %lu, tile decodes %d",
-                     refresh_max_us / 1000.0f, (unsigned long)refresh_late, tiles_decoded());
+            int tv[2], tmiss[2];
+            tiles_stats(tv, tmiss);
+            ESP_LOGI(TAG, "PANEL refresh max %.1f ms, late refreshes %lu, tile decodes %d, tiles in view %d+%d, missing %d+%d",
+                     refresh_max_us / 1000.0f, (unsigned long)refresh_late, tiles_decoded(), tv[0], tv[1], tmiss[0], tmiss[1]);
             refresh_max_us = 0;
             refresh_late = 0;
             ESP_LOGI(TAG, "SAT t=%.0f %s lat=%.3f lon=%.3f alt=%.1f rot=[%.2f %.2f %.2f]", now_unix(),

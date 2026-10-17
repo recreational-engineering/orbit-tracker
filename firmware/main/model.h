@@ -50,6 +50,8 @@ const snapshot_t *model_snapshot(void);
 eci_t model_propagate(double t);
 // Earth-fixed unit vector of an ECI position in the frame of sidereal angle gmst; returns |r| (km).
 double model_geo(const double r[3], double gmst, double u[3]);
+// Geodetic latitude, longitude (degrees) and height (km) of a propagated position.
+void model_geodetic(const eci_t *e, double *lat, double *lon, double *alt);
 // Straight-line distance (km) from Munich at ground level.
 double model_range_home(const eci_t *e);
 // Unit vector toward the sun in Earth-fixed axes (subsolarPoint()).

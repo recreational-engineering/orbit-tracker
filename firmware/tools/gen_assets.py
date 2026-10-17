@@ -170,7 +170,9 @@ def boost(img):
     """img: uint8 HxWx3 -> (boosted uint8 HxWx3, lake bool HxW), as boostTerrain() in app.js."""
     f = img.astype(np.float64)
     r, g, b = f[..., 0], f[..., 1], f[..., 2]
-    lake = (img[..., 0] > 242) & (img[..., 1] > 242) & (img[..., 2] > 242)
+    # White is open water in this data set; snow and ice are white with a blue tint (B > R),
+    # so only neutral white counts as a lake (bluish white stays land).
+    lake = (img[..., 0] > 242) & (img[..., 1] > 242) & (img[..., 2] > 242) & (f[..., 2] - f[..., 0] < 3)
     m = (r + g + b) / 3
     out = np.empty_like(img)
     for k in range(3):
@@ -227,7 +229,7 @@ def texture(land_topo, land_arcs):
 
     # City lights: level 0 at 2048 and the mip chain 1024 / 512 / 256 (loadNightLights()).
     night = np.asarray(Image.open(os.path.join(VENDOR, "night-2048.jpg")).convert("RGB"))
-    lv = [LIGHTS_LUT[night[..., 0]]]
+    lv = [LIGHTS_LUT[night[..., 0]] * near_land(land, 1)]   # lights on land (and the coast) only
     while len(lv) < 4:
         lv.append(halve(lv[-1]))
     with open(os.path.join(OUT, "lights.bin"), "wb") as f:
@@ -238,31 +240,86 @@ def texture(land_topo, land_arcs):
 
 # ---------- high-res tiles for the pilot view ----------
 HI_T, HI_ROWS, HI_COLS = 360, 15, 30
+# Tiles per 12° row. Toward the poles a degree of longitude shrinks, so the rows there take
+# fewer, wider tiles: the east-west texel stays at most the north-south one (3.7 km) at the
+# row's equator-side edge. Fixed 12° columns would put all 30 tiles of a polar row in view at
+# once, more than the device's tile cache holds. Must match HI_ROW_COLS in main/tiles.h.
+HI_ROW_COLS = [6, 12, 18, 24, 30, 30, 30, 30, 30, 30, 30, 24, 18, 12, 6]
 TILES_SRC = os.path.join(REPO, "web", "tiles")
+
+
+# The web/tiles sources were cut with `sips`, which centres a crop whose offset is 0: the
+# tiles of column 0 and of the two polar rows hold imagery from elsewhere (column 0 shows
+# France). Those cells come from the global texture instead (same data set, lower detail).
+def tile_is_broken(row, col):
+    return row == 0 or row == HI_ROWS - 1 or col == 0
+
+
+def tile_source(kind, row, col, globals_):
+    """uint8 HI_T x HI_T x 3 imagery for one 12° source cell."""
+    if tile_is_broken(row, col):
+        g = globals_[kind]
+        w, h = g.size
+        box = (col * w / HI_COLS, row * h / HI_ROWS, (col + 1) * w / HI_COLS, (row + 1) * h / HI_ROWS)
+        return np.asarray(g.resize((HI_T, HI_T), Image.LANCZOS, box=box))
+    return np.asarray(Image.open(os.path.join(TILES_SRC, kind, f"{row}_{col}.jpg")).convert("RGB"))
+
+
+def near_land(land, r):
+    """Land mask grown by r pixels (as 0/1 uint8)."""
+    m = land.astype(bool)
+    out = m.copy()
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            out |= np.roll(np.roll(m, dy, axis=0), dx, axis=1)
+    return out.astype(np.uint8)
+
+
+def resample_x(a, cols, mode):
+    """A full row strip (HI_T x HI_COLS*HI_T) to cols tiles of HI_T x HI_T, side by side."""
+    if cols == HI_COLS:
+        return a
+    w = cols * HI_T
+    if a.dtype == bool:
+        f = Image.fromarray(a.astype(np.uint8) * 255).resize((w, HI_T), Image.BOX)
+        return np.asarray(f) >= 128
+    return np.asarray(Image.fromarray(a).resize((w, HI_T), mode))
 
 
 def tiles_pack(land_topo, land_arcs):
     """tiles.bin for the 'tiles' flash partition: per tile a 4:4:4 JPEG of the final terrain
     colours (boost, land/sea from the land-50m mask, lakes and coastline baked in, as
     requestHiTile() + tileLandMask() + renderGlobePixels() do) and a greyscale JPEG of the
-    city-light intensity (requestLitTile()). Header: b'OTTL', count, then per tile
-    (terrain offset, length, lights offset, length)."""
-    W, H = HI_COLS * HI_T, HI_ROWS * HI_T
-    land_all = land_mask(land_topo, land_arcs, W, H, ss=1)
-    n = HI_ROWS * HI_COLS
+    city-light intensity (requestLitTile()). Tiles run row by row from the north, HI_ROW_COLS
+    per row, from 180° W. Header: b'OTTL', count, then per tile (terrain offset, length,
+    lights offset, length)."""
+    H = HI_ROWS * HI_T
+    land_by_cols = {c: land_mask(land_topo, land_arcs, c * HI_T, H, ss=1) for c in sorted(set(HI_ROW_COLS))}
+    globals_ = {"hyp": Image.open(os.path.join(VENDOR, "terrain-2048.jpg")).convert("RGB"),
+                "lights": Image.open(os.path.join(VENDOR, "night-2048.jpg")).convert("RGB")}
     blobs = []
-    for key in range(n):
-        row, col = divmod(key, HI_COLS)
-        img = np.asarray(Image.open(os.path.join(TILES_SRC, "hyp", f"{row}_{col}.jpg")).convert("RGB"))
-        boosted, lake = boost(img)
-        land = land_all[row * HI_T:(row + 1) * HI_T, col * HI_T:(col + 1) * HI_T]
-        day = finish(boosted, land, lake, wrap=False)
-        b1 = io.BytesIO()
-        Image.fromarray(day).save(b1, "JPEG", quality=88, subsampling=0)
-        lit = np.asarray(Image.open(os.path.join(TILES_SRC, "lights", f"{row}_{col}.jpg")).convert("RGB"))
-        b2 = io.BytesIO()
-        Image.fromarray(LIGHTS_LUT[lit[..., 0]], "L").save(b2, "JPEG", quality=85)
-        blobs.append((b1.getvalue(), b2.getvalue()))
+    for row, cols in enumerate(HI_ROW_COLS):
+        # The row's imagery at full source resolution, boosted (the lake test needs the source
+        # colours), then resampled east-west to this row's tile width.
+        hyp = np.hstack([tile_source("hyp", row, c, globals_) for c in range(HI_COLS)])
+        boosted, lake = boost(hyp)
+        boosted, lake = resample_x(boosted, cols, Image.LANCZOS), resample_x(lake, cols, None)
+        lit = np.hstack([tile_source("lights", row, c, globals_)[..., 0] for c in range(HI_COLS)])
+        lit = resample_x(LIGHTS_LUT[lit], cols, Image.BOX)
+        land_row = land_by_cols[cols][row * HI_T:(row + 1) * HI_T]
+        for col in range(cols):
+            sl = slice(col * HI_T, (col + 1) * HI_T)
+            land = land_row[:, sl]
+            day = finish(boosted[:, sl], land, lake[:, sl], wrap=False)
+            b1 = io.BytesIO()
+            Image.fromarray(day).save(b1, "JPEG", quality=88, subsampling=0)
+            # City lights only on land (and a few km off the coast, for registration): drops
+            # spurious light over open sea.
+            lit_l = lit[:, sl] * near_land(land, 3)
+            b2 = io.BytesIO()
+            Image.fromarray(lit_l.astype(np.uint8), "L").save(b2, "JPEG", quality=85)
+            blobs.append((b1.getvalue(), b2.getvalue()))
+    n = len(blobs)
     with open(os.path.join(OUT, "tiles.bin"), "wb") as f:
         hdr = 8 + n * 16
         off = (hdr + 15) & ~15

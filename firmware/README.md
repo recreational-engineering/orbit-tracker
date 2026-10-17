@@ -17,7 +17,9 @@ Code:
 - `main/dlist.c`, `main/gfx.c` – display list and the antialiased subset of Canvas 2D
 - `main/model.c`, `components/sgp4` – SGP4 propagation (Vallado), track, ticks, next pass
 - `main/tiles.c` – high-resolution terrain and city-light tiles for the pilot view (JPEG,
-  hardware decoder) from the `tiles` flash partition
+  hardware decoder) from the `tiles` flash partition: 12° rows, with fewer, wider tiles toward
+  the poles (so a polar view needs about as many tiles as any other); nearest tiles load first,
+  and a tile in view is never evicted for a farther one
 - `tools/gen_assets.py` – bakes textures, borders, graticule, fonts and the orbital
   elements (`../cache/gp_<NORAD>.json`) into `main/generated/`; `--tiles` builds `tiles.bin`
 
@@ -30,7 +32,7 @@ ESP-IDF v6.1. `gen_assets.py` needs Pillow and numpy.
     . ~/esp/esp-idf/export.sh
     idf.py build
     idf.py -p /dev/cu.usbmodem* flash
-    tools/flash_tiles.sh                   # once: writes tiles.bin to the tiles partition
+    tools/flash_tiles.sh                   # once (and after the tile layout changes): writes tiles.bin
 
 ## Clock and console
 
@@ -79,6 +81,9 @@ Test tools: `tools/drive.py` (scripted taps, drags and screenshots), `tools/perf
 `tools/flash_test.py` (all views, menu, resets and glides with the flash monitor on),
 `tools/pilot_flash_test.py` (cold start, pilot view entered repeatedly and left idle; counts late
 panel refreshes, DSI underruns and tile decodes).
+
+The `PANEL` stats line also gives the pilot view's tile cache: tiles decoded, the most tiles in
+view in one frame (terrain + lights; the caches hold 24 each) and the most tiles still missing.
 
 The stats line `PANEL refresh max … late refreshes …` counts panel refreshes that ended late (the
 panel's DMA is restarted from an interrupt each ~7.9 ms refresh; a late restart shows as a white

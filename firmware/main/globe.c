@@ -901,19 +901,24 @@ static void pilot_shade(const rctx_t *c, pp_t *p)
     int key = -1, tx = 0, ty = 0;
     const uint16_t *tile = NULL;
     if (p->t < c->hi_max_t) {   // high-res tile where the ground is near enough
-        float X = fu * (HI_COLS * HI_T), Y = fvn * (HI_ROWS * HI_T);
-        int col = (int)X / HI_T, row = (int)Y / HI_T;
-        key = row * HI_COLS + col;
-        tx = (int)X - col * HI_T;
-        ty = (int)Y - row * HI_T;
-        tile = tiles_terrain(key);
+        key = tiles_key(fu, fvn, &tx, &ty);
+        tile = tiles_terrain(key, p->fp);
     }
     uint32_t x;
     if (tile) {
         x = SPREAD(tile[ty * HI_T + tx]);
     } else {
-        int u = (int)(fu * TEX_W), v = (int)(fvn * TEX_H);
-        x = SPREAD(tex0(u < TEX_W ? u : TEX_W - 1, v));
+        // Global texture, bilinear: its texels (~20 km) span many pixels near the camera.
+        float gu = fu * TEX_W - 0.5f, gv = fvn * TEX_H - 0.5f;
+        int u0 = (int)floorf(gu), v0 = (int)floorf(gv);
+        int wu = (int)((gu - u0) * 32), wv = (int)((gv - v0) * 32);
+        if (u0 < 0) u0 += TEX_W;
+        int u1 = u0 + 1 < TEX_W ? u0 + 1 : 0;
+        int v1 = v0 + 1 < TEX_H ? v0 + 1 : TEX_H - 1;
+        if (v0 < 0) v0 = 0;
+        uint32_t top = (SPREAD(tex0(u0, v0)) * (32 - wu) + SPREAD(tex0(u1, v0)) * wu) >> 5 & SW_MASK;
+        uint32_t bot = (SPREAD(tex0(u0, v1)) * (32 - wu) + SPREAD(tex0(u1, v1)) * wu) >> 5 & SW_MASK;
+        x = (top * (32 - wv) + bot * wv) >> 5 & SW_MASK;
     }
     const int sunq = (int)(p->sun * 4096);
     int litq = 256;   // day side, for the haze colour
@@ -924,15 +929,24 @@ static void pilot_shade(const rctx_t *c, pp_t *p)
         // Lights level of detail by footprint: tile (≤ 5 km), its half mip (≤ 10 km), else global.
         int L = -1;
         if (key >= 0 && p->fp < 10) {
-            const uint8_t *lt = tiles_lights(key, p->fp < 5 ? 0 : 1);
+            const uint8_t *lt = tiles_lights(key, p->fp < 5 ? 0 : 1, p->fp);
             if (lt) L = p->fp < 5 ? lt[ty * HI_T + tx] : lt[(ty >> 1) * (HI_T / 2) + (tx >> 1)];
         }
         if (L < 0) {
             float ratio = p->fp * (1.0f / LIGHT_TEXEL_KM);
             int lv = ratio <= 1 ? 0 : ratio <= 2 ? 1 : ratio <= 4 ? 2 : 3;
+            // Bilinear, as the terrain fallback: near the camera a texel spans many pixels.
             int w = TEX_W >> lv, h = TEX_H >> lv;
-            int lu = (int)(fu * w), lvv = (int)(fvn * h);
-            L = lights[lv][lvv * w + (lu < w ? lu : w - 1)];
+            float gu = fu * w - 0.5f, gv = fvn * h - 0.5f;
+            int u0 = (int)floorf(gu), v0 = (int)floorf(gv);
+            int wu = (int)((gu - u0) * 256), wv = (int)((gv - v0) * 256);
+            if (u0 < 0) u0 += w;
+            int u1 = u0 + 1 < w ? u0 + 1 : 0;
+            int v1 = v0 + 1 < h ? v0 + 1 : h - 1;
+            if (v0 < 0) v0 = 0;
+            const uint8_t *l0 = lights[lv] + v0 * w, *l1 = lights[lv] + v1 * w;
+            int top = l0[u0] * (256 - wu) + l0[u1] * wu, bot = l1[u0] * (256 - wu) + l1[u1] * wu;
+            L = (top * (256 - wv) + bot * wv) >> 16;
         }
         x = sw_night(x, sunq, L);
     }

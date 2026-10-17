@@ -1276,12 +1276,15 @@ static void draw_hud(const snapshot_t *s)
     } else {
         snprintf(pass, sizeof pass, "--:--");
     }
-    snprintf(lat, sizeof lat, "%.1f°", fabs(s->lat));
-    snprintf(lon, sizeof lon, "%.1f°", fabs(s->lon));
-    snprintf(alt, sizeof alt, "%.0f", s->alt);
+    // Position from this frame's propagation: the snapshot lags after a clock change.
+    double la, lo, h;
+    model_geodetic(&st.now, &la, &lo, &h);
+    snprintf(lat, sizeof lat, "%.1f°", fabs(la));
+    snprintf(lon, sizeof lon, "%.1f°", fabs(lo));
+    snprintf(alt, sizeof alt, "%.0f", h);
     readout_t primary[] = {{ICON_DIST, range, "km"}, {ICON_PASS, pass, NULL}};
     readout_t primary_slots[] = {{ICON_DIST, "#####", "km"}, {ICON_PASS, "##:##", NULL}};
-    readout_t secondary[] = {{ICON_NONE, lat, s->lat >= 0 ? "N" : "S"}, {ICON_NONE, lon, s->lon >= 0 ? "E" : "W"},
+    readout_t secondary[] = {{ICON_NONE, lat, la >= 0 ? "N" : "S"}, {ICON_NONE, lon, lo >= 0 ? "E" : "W"},
                              {ICON_ALT, alt, "km"}};
     readout_t secondary_slots[] = {{ICON_NONE, "##.#°", "W"}, {ICON_NONE, "###.#°", "W"}, {ICON_ALT, "#####", "km"}};
     // Fixed tab width: fits the first row at the flat edge and the second row between the flanks.
