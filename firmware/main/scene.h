@@ -18,6 +18,8 @@ typedef struct {
 } scene_sat_t;
 
 void scene_init(void);
+// Reserve the render strip buffers in fast internal RAM; call first thing at boot.
+void scene_reserve_strips(void);
 // Advance the model to Unix time unix_s (wall clock dt since the last call, seconds).
 void scene_update(double unix_s, float dt, int64_t now_ms);
 void scene_render(uint16_t *fb, scene_timing_t *timing);

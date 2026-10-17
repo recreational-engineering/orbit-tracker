@@ -6,6 +6,8 @@ and the on-screen view menu; the settings panel is not ported. It boots into Ear
 
 - Views (menu: tap the bottom tab): Earth spin, ground reference, satellite reference,
   pilot reference, flat earth
+- Mounted with the USB-C power connector at the bottom: frames and touch are turned 180° from
+  the panel's native orientation (`GFX_ROT180` in `main/gfx.h`); screenshots come out upright
 - Touch: drag to pan (trackball; the flat earth turns about the pole, the pilot view
   looks around), flick for inertia; tap the top tab or double-tap to reset; the view
   glides back 4 s after a pan
@@ -103,7 +105,10 @@ Each frame is recorded into a display list on both cores, then drawn in 20-row s
 of internal RAM (globe pixels, then the vector layers), each core taking every other
 strip, and copied to one of three frame buffers; the panel swaps at the end of a
 refresh, so frames never tear and the loop never waits for the panel. (The strips are
-kept small so the renderer's internal RAM coexists with the Wi-Fi/ESP-Hosted stack.)
+kept small so the renderer's internal RAM coexists with the Wi-Fi/ESP-Hosted stack. They must
+be in the main SRAM: the P4's low-power SRAM also counts as internal RAM but is several times
+slower, so a strip there quarters the frame rate. The console and network task stacks live in
+the low-power SRAM to leave the main SRAM to the strips and Wi-Fi.)
 
 - Earth spin is drawn at full resolution every frame (the globe turns all the time).
 - Ground, satellite reference and flat earth show a full-resolution globe rendered by a

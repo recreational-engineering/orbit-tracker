@@ -12,6 +12,10 @@
 
 #define GFX_W 720
 #define GFX_H 720
+// The board is mounted with its USB-C power connector at the bottom, upside down from the
+// panel's native scan: frames are written into the frame buffer turned 180°, and touch
+// coordinates are turned to match. 0 for the native orientation.
+#define GFX_ROT180 1
 
 typedef struct { uint8_t r, g, b; } rgb_t;
 #define RGB(r, g, b) ((rgb_t){(r), (g), (b)})

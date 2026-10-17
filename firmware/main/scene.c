@@ -1578,6 +1578,23 @@ typedef struct {
     const snapshot_t *snap;
 } frame_job_t;
 
+// A finished strip (rows y0 .. y0 + n) into the frame buffer, turned 180° if the board is
+// mounted that way. Each row is reversed in place in the (internal RAM) strip and then copied
+// forward to its mirrored row: writing PSRAM backwards pixel by pixel is several times slower.
+static void strip_out(uint16_t *fb, uint16_t *sb, int y0, int n)
+{
+#if GFX_ROT180
+    for (int r = 0; r < n; r++) {
+        uint32_t *a = (uint32_t *)(sb + r * S), *b = a + S / 2 - 1;
+        for (; a < b; a++, b--) { uint32_t va = *a, vb = *b; *a = vb >> 16 | vb << 16; *b = va >> 16 | va << 16; }
+        if (a == b) *a = *a >> 16 | *a << 16;
+        memcpy(fb + (S - 1 - y0 - r) * S, sb + r * S, S * 2);
+    }
+#else
+    memcpy(fb + y0 * S, sb, n * S * 2);
+#endif
+}
+
 // One strip buffer in internal RAM per core.
 static uint16_t *strip_buf[2];
 
@@ -1631,7 +1648,7 @@ static void frame_strips(int part, const void *vctx)
         gfx_target(fbv);
         gfx_clip_rows(y0, y1);
         dl_replay(k);
-        memcpy(j->fb + y0 * S, sb, (y1 - y0) * S * 2);
+        strip_out(j->fb, sb, y0, y1 - y0);
     }
     gfx_clip_rows(0, S);
 }
@@ -1746,11 +1763,24 @@ void scene_init(void)
     find_widest(&RF_PRIMARY);
     find_widest(&RF_SECONDARY);
     st.spin_t0 = esp_timer_get_time() / 1000;   // boot into Earth spin
-    for (int i = 0; i < 2; i++) {
-        strip_buf[i] = heap_caps_aligned_alloc(16, DL_STRIP_H * S * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (!strip_buf[i]) ESP_LOGE("scene", "no internal RAM for strip buffer %d", i);
-    }
+    scene_reserve_strips();
     ESP_LOGI("scene", "internal RAM free %u after strips", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+}
+
+void scene_reserve_strips(void)
+{
+    // In the main SRAM (L2MEM, the DMA-capable internal RAM). "Internal" alone also admits the
+    // P4's low-power SRAM, which is several times slower: a strip there quarters the frame rate,
+    // and the allocator picks it as soon as the main SRAM has no contiguous block left. So the
+    // strips are reserved first thing at boot, and a fallback is reported, not silent.
+    for (int i = 0; i < 2; i++) {
+        if (strip_buf[i]) continue;
+        strip_buf[i] = heap_caps_aligned_alloc(16, DL_STRIP_H * S * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (!strip_buf[i]) {
+            strip_buf[i] = heap_caps_aligned_alloc(16, DL_STRIP_H * S * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            ESP_LOGE("scene", "strip buffer %d not in main SRAM (%p): rendering will be slow", i, strip_buf[i]);
+        }
+    }
 }
 
 bool scene_background_busy(void) { return globe_cache_busy(); }

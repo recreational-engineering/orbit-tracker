@@ -22,6 +22,7 @@
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_touch_gt911.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -221,10 +222,26 @@ static void dump_frame(const uint16_t *fb)
     const int port = CONFIG_ESP_CONSOLE_UART_NUM;
     const char *hdr = "\n@@FRAME 720 720 RGB565LE@@\n";
     uart_write_bytes(port, hdr, strlen(hdr));
-    for (int y = 0; y < GFX_H; y++) uart_write_bytes(port, (const char *)(fb + y * GFX_W), GFX_W * 2);
+    // Upright, as seen on the mounted display (the frame buffer may hold it turned 180°).
+    // (A row buffer in PSRAM, only while dumping: internal RAM is kept for the renderer.)
+    uint16_t *row = heap_caps_malloc(GFX_W * 2, MALLOC_CAP_SPIRAM);
+    for (int y = 0; y < GFX_H && row; y++) {
+        const uint16_t *src = fb + (GFX_ROT180 ? GFX_H - 1 - y : y) * GFX_W;
+        for (int x = 0; x < GFX_W; x++) row[x] = src[GFX_ROT180 ? GFX_W - 1 - x : x];
+        uart_write_bytes(port, (const char *)row, GFX_W * 2);
+    }
+    free(row);
     uart_write_bytes(port, "@@END@@\n", 8);
     uart_wait_tx_done(port, portMAX_DELAY);
     esp_log_level_set("*", ESP_LOG_INFO);
+}
+
+// A task that mostly waits (console, network): its stack goes into the low-power SRAM, which is
+// slow but otherwise unused, so the main SRAM stays free for the render strips and Wi-Fi.
+static void idle_task(TaskFunction_t fn, const char *name, int stack, int prio)
+{
+    if (xTaskCreatePinnedToCoreWithCaps(fn, name, stack, NULL, prio, NULL, 0, MALLOC_CAP_RTCRAM) != pdPASS)
+        xTaskCreatePinnedToCore(fn, name, stack, NULL, prio, NULL, 0);
 }
 
 void app_main(void)
@@ -257,9 +274,9 @@ void app_main(void)
 
     vTaskPrioritySet(NULL, 5);   // frame loop above the background globe redraws
     scene_init();
-    xTaskCreatePinnedToCore(console_task, "console", 4096, NULL, 5, NULL, 0);
+    idle_task(console_task, "console", 4096, 5);
     net_init();
-    xTaskCreatePinnedToCore(net_task, "net", 12288, NULL, 4, NULL, 0);
+    idle_task(net_task, "net", 12288, 4);
 
     bool first = true;
     int frames = 0, half_frames = 0;
@@ -320,6 +337,7 @@ void app_main(void)
             uint8_t cnt = 0;
             esp_lcd_touch_read_data(touch);
             esp_lcd_touch_get_data(touch, &pt, &cnt, 1);
+            if (GFX_ROT180) { pt.x = GFX_W - 1 - pt.x; pt.y = GFX_H - 1 - pt.y; }
             if (cnt) last_touch_ms = ms;
             if (swallow) {
                 swallow = cnt > 0;   // until the waking finger is lifted
