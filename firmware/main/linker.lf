@@ -1,0 +1,9 @@
+# The per-pixel and replay code runs from internal RAM: from flash, its code competes in the
+# L2 cache with the texture and frame-buffer traffic and keeps being refetched over SPI.
+[mapping:orbit_render]
+archive: libmain.a
+entries:
+    gfx (noflash)
+    globe (noflash)
+    dlist (noflash)
+    tiles (noflash)

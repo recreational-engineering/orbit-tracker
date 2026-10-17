@@ -1,0 +1,316 @@
+/* Orbit tracker on the Waveshare ESP32-P4-WIFI6-Touch-LCD-4C (720x720 round MIPI-DSI).
+ *
+ * Renders the globe of the web prototype (web/app.js) into two DPI frame buffers
+ * and flips between them. Serial console (2 Mbaud) commands, one per line:
+ *   T<unix seconds>   set the clock (tools/set_time.py)
+ *   S                 dump the frame on screen as raw RGB565 (tools/screenshot.py)
+ *   G x0 y0 x1 y1 ms  simulated finger drag (testing without touching the panel)
+ *   K x y             simulated tap
+ *   P                 print frame statistics since the last P (and stop the periodic ones)
+ */
+#include <stdio.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include "bsp/esp-bsp.h"
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
+#include "esp_lcd_mipi_dsi.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_touch_gt911.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "gfx.h"
+#include "scene.h"
+#include "tiles.h"
+#include "generated/elements.h"
+
+static const char *TAG = "orbit";
+
+#define FRAME_HZ 30
+
+static esp_lcd_panel_handle_t panel;
+static esp_lcd_touch_handle_t touch;
+static SemaphoreHandle_t fb_released;
+static volatile bool want_screenshot, clock_changed, want_stats, stats_on_demand, flash_watch;
+
+// Flash monitor (console "F" toggles it): a 16x16 grid of cell brightnesses per frame. A cell
+// that jumps away for exactly one frame and comes back (frame n differs from n-1 and n+1 while
+// those two agree) is the signature of a glitch frame; such frames are counted and logged.
+#define FW_N 16
+static int fw_hist[3][FW_N * FW_N], fw_frames, fw_glitches;
+
+static void flash_check(const uint16_t *fb, bool half)
+{
+    int *cur = fw_hist[fw_frames % 3];
+    for (int cy = 0; cy < FW_N; cy++)
+        for (int cx = 0; cx < FW_N; cx++) {
+            int sum = 0;   // 6 x 6 samples over the 45 x 45 px cell: moving fine detail averages out
+            for (int q = 0; q < 36; q++) {
+                int x = cx * (GFX_W / FW_N) + 3 + (q % 6) * 7, y = cy * (GFX_H / FW_N) + 3 + (q / 6) * 7;
+                uint16_t p = fb[y * GFX_W + x];
+                sum += ((p >> 11) & 31) * 2 + ((p >> 5) & 63) * 2 + (p & 31);   // ~ luminance, max 219
+            }
+            cur[cy * FW_N + cx] = sum;
+        }
+    fw_frames++;
+    if (fw_frames < 3) return;
+    const int *a = fw_hist[(fw_frames - 3) % 3], *b = fw_hist[(fw_frames - 2) % 3], *c = cur;
+    int odd = 0;
+    for (int i = 0; i < FW_N * FW_N; i++) {
+        int ab = abs(b[i] - a[i]), bc = abs(b[i] - c[i]), ac = abs(a[i] - c[i]);
+        // A jump of over a sixth of full brightness (36 · 219 / 6) that comes back.
+        if (ab > 1300 && bc > 1300 && ac * 3 < (ab < bc ? ab : bc)) odd++;
+    }
+    if (odd >= 2) {
+        fw_glitches++;
+        int first = -1;
+        for (int i = 0; i < FW_N * FW_N && first < 0; i++) {
+            int ab = abs(b[i] - a[i]), bc = abs(b[i] - c[i]), ac = abs(a[i] - c[i]);
+            if (ab > 1300 && bc > 1300 && ac * 3 < (ab < bc ? ab : bc)) first = i;
+        }
+        ESP_LOGW(TAG, "FLASH? frame %d (%s, %s): %d of %d cells jumped for one frame, first at cell (%d, %d): %d -> %d -> %d",
+                 fw_frames - 2, scene_mode_name(), half ? "half-res" : "full/cached", odd, FW_N * FW_N, first % FW_N, first / FW_N,
+                 a[first], b[first], c[first]);
+    }
+}
+
+// Simulated touch from the console: a drag from (x0, y0) to (x1, y1) over `ms`, or a tap.
+static struct { volatile bool pending; int x0, y0, x1, y1, ms; } sim;
+static struct { bool active; int64_t start; int x0, y0, x1, y1, ms, phase; } sim_run;
+
+// Three frame buffers, drawn round robin: the panel scans one, the last one handed over waits
+// for the end of the current refresh, the third is drawn. At the end of each refresh the
+// panel starts on the last buffer handed over.
+#define NFB 3
+static volatile int fb_submitted, fb_scanning;
+
+// Panel refresh health: a refresh that ends much later than the 60 Hz period means the panel's
+// DMA was restarted late and it showed a broken frame (seen as a white flash).
+static volatile uint32_t refresh_late, refresh_max_us;
+static volatile int64_t refresh_last;
+
+static bool IRAM_ATTR on_frame_buf_complete(esp_lcd_panel_handle_t p, esp_lcd_dpi_panel_event_data_t *e, void *ctx)
+{
+    int64_t t = esp_timer_get_time();
+    if (refresh_last) {
+        uint32_t d = (uint32_t)(t - refresh_last);
+        if (d > refresh_max_us) refresh_max_us = d;
+        if (d > 12000) refresh_late++;   // 1.5 periods of the ~126 Hz refresh
+    }
+    refresh_last = t;
+    fb_scanning = fb_submitted;
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(fb_released, &woken);
+    return woken == pdTRUE;
+}
+
+static double now_unix(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec / 1e6;
+}
+
+static void touch_init(void)
+{
+    ESP_ERROR_CHECK(bsp_i2c_init());
+    esp_lcd_panel_io_i2c_config_t io_cfg = ESP_LCD_TOUCH_IO_I2C_GT911_CONFIG();
+    io_cfg.scl_speed_hz = CONFIG_BSP_I2C_CLK_SPEED_HZ;
+    esp_lcd_panel_io_handle_t io;
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(bsp_i2c_get_handle(), &io_cfg, &io));
+    const esp_lcd_touch_config_t cfg = {
+        .x_max = GFX_W, .y_max = GFX_H,
+        .rst_gpio_num = GPIO_NUM_NC, .int_gpio_num = GPIO_NUM_NC,
+    };
+    if (esp_lcd_touch_new_i2c_gt911(io, &cfg, &touch) != ESP_OK) {
+        ESP_LOGW(TAG, "touch controller not found, panning disabled");
+        touch = NULL;
+    }
+}
+
+static void console_task(void *arg)
+{
+    char line[64];
+    int n = 0;
+    for (;;) {
+        uint8_t c;
+        if (uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, &c, 1, portMAX_DELAY) != 1) continue;
+        if (c != '\n' && c != '\r') {
+            if (n < (int)sizeof line - 1) line[n++] = c;
+            continue;
+        }
+        line[n] = 0;
+        n = 0;
+        // Opening the port can put a stray byte on the line: start at the command letter.
+        const char *cmd = line;
+        while (*cmd && (*cmd < 'A' || *cmd > 'Z')) cmd++;
+        if (cmd[0] == 'T') {
+            double t = atof(cmd + 1);
+            struct timeval tv = {.tv_sec = (time_t)t, .tv_usec = (suseconds_t)((t - (time_t)t) * 1e6)};
+            settimeofday(&tv, NULL);
+            clock_changed = true;
+            ESP_LOGI(TAG, "TIME set to %.3f", t);
+        } else if (cmd[0] == 'G' || cmd[0] == 'K') {
+            int v[5] = {0};
+            int n = sscanf(cmd + 1, "%d %d %d %d %d", &v[0], &v[1], &v[2], &v[3], &v[4]);
+            if (cmd[0] == 'K' && n == 2) { v[2] = v[0]; v[3] = v[1]; v[4] = 0; n = 5; }
+            if (n == 5) {
+                sim.x0 = v[0]; sim.y0 = v[1]; sim.x1 = v[2]; sim.y1 = v[3]; sim.ms = v[4];
+                sim.pending = true;
+            }
+        } else if (cmd[0] == 'F') {
+            flash_watch = !flash_watch;
+        } else if (cmd[0] == 'P') {
+            want_stats = true;
+            stats_on_demand = true;
+        } else if (cmd[0] == 'S') {
+            want_screenshot = true;
+        }
+    }
+}
+
+static void dump_frame(const uint16_t *fb)
+{
+    esp_log_level_set("*", ESP_LOG_NONE);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    const int port = CONFIG_ESP_CONSOLE_UART_NUM;
+    const char *hdr = "\n@@FRAME 720 720 RGB565LE@@\n";
+    uart_write_bytes(port, hdr, strlen(hdr));
+    for (int y = 0; y < GFX_H; y++) uart_write_bytes(port, (const char *)(fb + y * GFX_W), GFX_W * 2);
+    uart_write_bytes(port, "@@END@@\n", 8);
+    uart_wait_tx_done(port, portMAX_DELAY);
+    esp_log_level_set("*", ESP_LOG_INFO);
+}
+
+void app_main(void)
+{
+    // Console: driver-backed so the console task can read commands.
+    ESP_ERROR_CHECK(uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 1024, 64 * 1024, 0, NULL, 0));
+    uart_vfs_dev_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
+
+    // No RTC battery or network time yet: never run earlier than the asset build.
+    if (now_unix() < ASSETS_GEN_UNIX) {
+        struct timeval tv = {.tv_sec = ASSETS_GEN_UNIX};
+        settimeofday(&tv, NULL);
+        ESP_LOGW(TAG, "clock not set, starting at asset build time; send T<unix> to set it");
+    }
+
+    esp_lcd_panel_io_handle_t io;
+    ESP_ERROR_CHECK(bsp_display_new(NULL, &panel, &io));
+    void *fbs[NFB];
+    ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(panel, NFB, &fbs[0], &fbs[1], &fbs[2]));
+    fb_released = xSemaphoreCreateBinary();
+    esp_lcd_dpi_panel_event_callbacks_t cbs = {.on_frame_buf_complete = on_frame_buf_complete};
+    ESP_ERROR_CHECK(esp_lcd_dpi_panel_register_event_callbacks(panel, &cbs, NULL));
+    touch_init();
+
+    vTaskPrioritySet(NULL, 5);   // frame loop above the background globe redraws
+    scene_init();
+    xTaskCreatePinnedToCore(console_task, "console", 4096, NULL, 5, NULL, 0);
+
+    bool first = true;
+    int frames = 0, half_frames = 0;
+    float worst_ms = 0, worst_gap_ms = 0;
+    int64_t last_present = 0;
+    scene_timing_t sum = {0}, tm;
+    int64_t last = esp_timer_get_time(), stats_at = last;
+    bool was_pressed = false;
+    for (;;) {
+        int64_t now = esp_timer_get_time();
+        float dt = (now - last) / 1e6f;
+        last = now;
+        int64_t ms = now / 1000;
+
+        if (sim.pending) {
+            sim.pending = false;
+            sim_run = (typeof(sim_run)){true, ms, sim.x0, sim.y0, sim.x1, sim.y1, sim.ms, 0};
+        }
+        if (sim_run.active) {
+            // Finger down at the start, moved along the line, lifted one frame after the end.
+            float k = sim_run.ms > 0 ? fminf(1, (ms - sim_run.start) / (float)sim_run.ms) : 1;
+            if (sim_run.phase < 2) {
+                scene_touch(true, (int)lroundf(sim_run.x0 + (sim_run.x1 - sim_run.x0) * k),
+                            (int)lroundf(sim_run.y0 + (sim_run.y1 - sim_run.y0) * k), ms);
+                if (k >= 1) sim_run.phase++;
+            } else {
+                scene_touch(false, 0, 0, ms);
+                sim_run.active = false;
+            }
+        } else if (touch) {
+            esp_lcd_touch_point_data_t pt;
+            uint8_t cnt = 0;
+            esp_lcd_touch_read_data(touch);
+            esp_lcd_touch_get_data(touch, &pt, &cnt, 1);
+            if (cnt) scene_touch(true, pt.x, pt.y, ms);
+            else if (was_pressed) scene_touch(false, 0, 0, ms);
+            was_pressed = cnt > 0;
+        }
+        if (clock_changed) { clock_changed = false; scene_clock_changed(now_unix()); }
+        scene_update(now_unix(), dt, ms);
+
+        // The next buffer round robin is free unless two frames were handed over within one
+        // refresh (then the panel still scans it): wait for the refresh to end.
+        int back = (fb_submitted + 1) % NFB;
+        while (back == fb_scanning) {
+            xSemaphoreTake(fb_released, 0);
+            if (back == fb_scanning) xSemaphoreTake(fb_released, pdMS_TO_TICKS(40));
+        }
+        uint16_t *fb = fbs[back];
+        scene_render(fb, &tm);
+        esp_lcd_panel_draw_bitmap(panel, 0, 0, GFX_W, GFX_H, fb);
+        fb_submitted = back;
+        if (flash_watch) flash_check(fb, tm.half_res);
+        else if (fw_frames) {
+            ESP_LOGI(TAG, "flash monitor: %d frames, %d suspicious", fw_frames, fw_glitches);
+            fw_frames = fw_glitches = 0;
+        }
+        int64_t presented = esp_timer_get_time();
+        if (last_present && (presented - last_present) / 1000.0f > worst_gap_ms) worst_gap_ms = (presented - last_present) / 1000.0f;
+        last_present = presented;
+        if (first) { bsp_display_brightness_set(100); first = false; }
+
+        if (want_screenshot) { want_screenshot = false; dump_frame(fb); last = esp_timer_get_time(); }
+
+        // Cap at FRAME_HZ; while a full-resolution globe is rendered in the background (still
+        // views), leave it a share of both cores.
+        int64_t spent = esp_timer_get_time() - now;
+        int min_ms = scene_background_busy() ? 8 : 1;
+        int wait_ms = (int)((1000000 / FRAME_HZ - spent) / 1000);
+        vTaskDelay(pdMS_TO_TICKS(wait_ms > min_ms ? wait_ms : min_ms));
+
+        frames++;
+        half_frames += tm.half_res;
+        if (tm.total_ms > worst_ms) worst_ms = tm.total_ms;
+        sum.base_ms += tm.base_ms; sum.lines_ms += tm.lines_ms; sum.overlay_ms += tm.overlay_ms;
+        sum.total_ms += tm.total_ms;
+        if (want_stats || (!stats_on_demand && now - stats_at > 5000000)) {
+            want_stats = false;
+            float secs = (now - stats_at) / 1e6f;
+            scene_sat_t s = scene_sat();
+            float rot[3];
+            scene_rotation(rot);
+            int redraws;
+            float redraw_ms;
+            scene_globe_stats(&redraws, &redraw_ms);
+            ESP_LOGI(TAG, "STATS %s %.1f fps | gap max %.0f ms | frame %.1f ms, worst %.1f (record %.1f, strips %.1f, overlay %.1f) | "
+                     "half-res %d/%d | full-res renders %d x %.0f ms",
+                     scene_mode_name(), frames / secs, worst_gap_ms, sum.total_ms / frames, worst_ms, sum.base_ms / frames, sum.lines_ms / frames,
+                     sum.overlay_ms / frames, half_frames, frames, redraws, redraw_ms);
+            ESP_LOGI(TAG, "PANEL refresh max %.1f ms, late refreshes %lu, tile decodes %d",
+                     refresh_max_us / 1000.0f, (unsigned long)refresh_late, tiles_decoded());
+            refresh_max_us = 0;
+            refresh_late = 0;
+            ESP_LOGI(TAG, "SAT t=%.0f %s lat=%.3f lon=%.3f alt=%.1f rot=[%.2f %.2f %.2f]", now_unix(),
+                     scene_mode_name(), s.lat, s.lon, s.alt, rot[0], rot[1], rot[2]);
+            frames = half_frames = 0;
+            worst_ms = worst_gap_ms = 0;
+            memset(&sum, 0, sizeof sum);
+            stats_at = now;
+        }
+    }
+}

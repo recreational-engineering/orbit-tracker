@@ -1,0 +1,6 @@
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     ,         0x6000
+phy_init, data, phy,     ,         0x1000
+factory,  app,  factory, 0x20000,  12M
+# High-res pilot-view tiles (generated/tiles.bin, see tools/flash_tiles.sh)
+tiles,    data, 0x40,    0xC20000, 11M
