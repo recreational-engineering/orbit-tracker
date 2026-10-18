@@ -292,10 +292,12 @@ static void build_static_layers(void)
         night_a[k] = (uint8_t)(0.78f * n * 256);
         night_n[k] = (uint16_t)(n * 256);
     }
-    // Pilot rim vignette: radial gradient from 0.75 c (transparent) to c (.45 black).
+    // Pilot rim vignette: from 0.75 c (transparent) to c (.45 black), eased in and out
+    // (smoothstep): a linear ramp starts with a kink the eye reads as a ring.
     for (int i = 0; i <= RIM_LUT_N; i++) {
         float r = sqrtf((float)i / RIM_LUT_N), t = (r - 0.75f) / 0.25f;
         t = t < 0 ? 0 : t > 1 ? 1 : t;
+        t = t * t * (3 - 2 * t);
         pilot_rim[i] = (uint8_t)(255 * (1 - 0.45f * t) + 0.5f);
     }
     ESP_LOGI(TAG, "disc pixels %ld, blocks %ld", (long)n_px, (long)hn);
@@ -1194,12 +1196,14 @@ static uint16_t pilot_shade(const rctx_t *c, const pq_t *p, uint32_t dq, tile_me
 }
 
 // Rim vignette at (dx, dy) from the centre (whole pixels): pilot_rim on (r / c)²,
-// RIM_LUT_N · 4 / S² as 8285 / 2^20.
-static inline uint16_t pilot_finish(uint16_t px, int dx, int dy)
+// RIM_LUT_N · 4 / S² as 8285 / 2^20. The factor (32 steps) and the truncated product are both
+// dithered (dq, dq2: two DQ entries of the block): undithered, the fade showed as rings.
+static inline uint16_t pilot_finish(uint16_t px, int dx, int dy, uint32_t dq, uint32_t dq2)
 {
     const int i = ((dx * dx + dy * dy) * 8285) >> 20;
-    const int m = pilot_rim[i < RIM_LUT_N ? i : RIM_LUT_N];
-    return UNSPREAD(((SPREAD(px) * ((m + 4) >> 3)) >> 5) & SW_MASK);
+    const uint32_t m = pilot_rim[i < RIM_LUT_N ? i : RIM_LUT_N];
+    const uint32_t m5 = (m + ((dq2 & 31) >> 2)) >> 3;   // 0 .. 32
+    return UNSPREAD(((SPREAD(px) * m5 + dq) >> 5) & SW_MASK);
 }
 
 static inline bool pilot_span_linear(const pp_t *a, const pp_t *b, float *du)
@@ -1285,7 +1289,8 @@ static void pilot_rows_half(const rctx_t *c, int by)
                 if (p.ground) { pq_t qe; pilot_fixed(&p, &qe); px = pilot_shade(c, &qe, dth, &memo); }
                 else px = p.px;
             }
-            if (x <= xr0 || x >= xr1) px = pilot_finish(px, x + 1 - (int)CX, y0 + 1 - (int)CY);
+            if (x <= xr0 || x >= xr1)
+                px = pilot_finish(px, x + 1 - (int)CX, y0 + 1 - (int)CY, dth, DQ[(by + 2) & 3][(bx + 1) & 3]);
             if (x >= xin0 && x <= xin1) {
                 const uint32_t pp = px | (uint32_t)px << 16;   // x is even: aligned pairs
                 *(uint32_t *)(row0 + x) = pp;

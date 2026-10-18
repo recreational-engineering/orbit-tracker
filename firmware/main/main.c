@@ -8,7 +8,8 @@
  *   K x y             simulated tap
  *   P                 print frame statistics since the last P (and stop the periodic ones)
  *
- * Standby: 22:00-08:00 local time the backlight is off; a touch wakes it for 5 minutes.
+ * Standby: weekdays 20:00-08:00 and all of Saturday and Sunday (local time) the backlight is
+ * off; a touch wakes it for 30 minutes.
  */
 #include <stdio.h>
 #include <math.h>
@@ -41,19 +42,22 @@ static const char *TAG = "orbit";
 
 #define FRAME_HZ 30
 
-// Standby: from 22:00 to 08:00 local time the backlight is switched off (its LED driver gets
-// no on-time at all, so no light leaks as a black frame would) and nothing is rendered; the
-// touch controller stays on. A touch wakes the display, which goes dark again after
-// STANDBY_IDLE_S without a touch.
-#define STANDBY_FROM_H 22
+// Standby: on weekdays from 20:00 to 08:00 and all day on Saturday and Sunday (local time) the
+// backlight is switched off (its LED driver gets no on-time at all, so no light leaks as a black
+// frame would) and nothing is rendered; the touch controller stays on. A touch wakes the
+// display, which goes dark again after STANDBY_IDLE_S without a touch.
+#define STANDBY_FROM_H 20
 #define STANDBY_TO_H 8
-#define STANDBY_IDLE_S 300
+#ifndef STANDBY_IDLE_S
+#define STANDBY_IDLE_S (30 * 60)
+#endif
 
-static bool night_hours(void)
+static bool standby_hours(void)
 {
     time_t t = time(NULL);
     struct tm lt;
     localtime_r(&t, &lt);   // TZ = Europe/Berlin
+    if (lt.tm_wday == 0 || lt.tm_wday == 6) return true;   // Sunday, Saturday
     return lt.tm_hour >= STANDBY_FROM_H || lt.tm_hour < STANDBY_TO_H;
 }
 
@@ -327,8 +331,8 @@ void app_main(void)
     int64_t last_touch_ms = 0;
     for (;;) {
         if (dark) {
-            // Poll the touch controller at 20 Hz; wake on a touch (real or simulated) or at
-            // the end of the night hours.
+            // Poll the touch controller at 20 Hz; wake on a touch (real or simulated) or when
+            // the standby hours end (08:00 on a weekday).
             uint8_t cnt = 0;
             if (touch) {
                 esp_lcd_touch_point_data_t pt;
@@ -336,7 +340,7 @@ void app_main(void)
                 esp_lcd_touch_get_data(touch, &pt, &cnt, 1);
             }
             bool touched = cnt > 0 || sim.pending;
-            if (!touched && night_hours()) {
+            if (!touched && standby_hours()) {
                 vTaskDelay(pdMS_TO_TICKS(50));
                 continue;
             }
@@ -394,7 +398,7 @@ void app_main(void)
             }
         }
         if (sim_run.active) last_touch_ms = ms;
-        if (night_hours() && ms - last_touch_ms > STANDBY_IDLE_S * 1000LL) {
+        if (standby_hours() && ms - last_touch_ms > STANDBY_IDLE_S * 1000LL) {
             bsp_display_brightness_set(0);
             if (was_pressed) scene_touch(false, 0, 0, ms);
             was_pressed = false;

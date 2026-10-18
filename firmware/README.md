@@ -38,10 +38,11 @@ ESP-IDF v6.1. `gen_assets.py` needs Pillow and numpy.
 
 ## Standby
 
-From 22:00 to 08:00 (Munich time) the display goes dark after 5 minutes without a touch: the
-backlight is switched off (no light, unlike a black frame) and nothing is rendered, while the
-touch controller keeps polling. A touch wakes it (that touch is not taken as a tap) for another
-5 minutes; at 08:00 it comes on by itself. The console logs `standby: display off/on`.
+On weekdays from 20:00 to 08:00 and all day on Saturday and Sunday (Munich time) the display
+goes dark after 30 minutes without a touch: the backlight is switched off (no light, unlike a
+black frame) and nothing is rendered, while the touch controller keeps polling. A touch wakes it
+(that touch is not taken as a tap) for another 30 minutes; at 08:00 on a weekday it comes on by
+itself. The console logs `standby: display off/on`.
 
 ## Clock and console
 
