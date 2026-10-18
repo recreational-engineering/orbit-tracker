@@ -9,6 +9,7 @@
 typedef struct {
     float base_ms;      // globe pixels for this frame (copy of the cached globe or a half-res render)
     float lines_ms, overlay_ms, total_ms;
+    float px_ms, replay_ms, copy_ms;   // strips on the busier core: globe pixels, vector replay, copy out
     bool half_res;      // globe rendered at half resolution this frame (view moving)
 } scene_timing_t;
 
@@ -20,6 +21,8 @@ typedef struct {
 void scene_init(void);
 // Reserve the render strip buffers in fast internal RAM; call first thing at boot.
 void scene_reserve_strips(void);
+// Whether both render strips are in the main SRAM (else rendering is several times slower).
+bool scene_strips_fast(void);
 // Advance the model to Unix time unix_s (wall clock dt since the last call, seconds).
 void scene_update(double unix_s, float dt, int64_t now_ms);
 void scene_render(uint16_t *fb, scene_timing_t *timing);

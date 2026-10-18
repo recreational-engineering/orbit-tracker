@@ -91,20 +91,43 @@ Test tools: `tools/drive.py` (scripted taps, drags and screenshots), `tools/perf
 `tools/pilot_flash_test.py` (cold start, pilot view entered repeatedly and left idle; counts late
 panel refreshes, DSI underruns and tile decodes).
 
-The `PANEL` stats line also gives the pilot view's tile cache: tiles decoded, the most tiles in
-view in one frame (terrain + lights; the caches hold 24 each) and the most tiles still missing.
+The `STATS` line splits the strip time of the busier core into globe pixels (`px`), vector
+layers (`replay`) and the copy to the frame buffer (`copy`). The `PANEL` line gives frames that
+missed their refresh slot (`frames off target`, see frame pacing below), whether the render
+strips are in fast RAM (`strips fast`), and the pilot view's tile cache: tiles decoded, the most
+tiles in view in one frame (terrain + lights; the caches hold 22 and 14) and the most still
+missing.
 
 The stats line `PANEL refresh max … late refreshes …` counts panel refreshes that ended late (the
-panel's DMA is restarted from an interrupt each ~7.9 ms refresh; a late restart shows as a white
-flash). Tiles are therefore read from memory-mapped flash (a flash read operation would pause
-interrupts) and the display interrupts are cache-safe (`CONFIG_LCD_DSI_ISR_CACHE_SAFE`).
+panel's DMA is restarted from an interrupt each ~15.4 ms refresh; a late restart shows as a white
+flash). The display interrupts are cache-safe (`CONFIG_LCD_DSI_ISR_CACHE_SAFE`) and flash reads
+are avoided while the panel runs. (The tiles partition lies beyond the 16 MB the cache can map,
+so tile reads still use flash operations; see the open task on the flash layout.)
 
 ## Rendering and performance
 
 Each frame is recorded into a display list on both cores, then drawn in 20-row strips
 of internal RAM (globe pixels, then the vector layers), each core taking every other
 strip, and copied to one of three frame buffers; the panel swaps at the end of a
-refresh, so frames never tear and the loop never waits for the panel. (The strips are
+refresh, so frames never tear.
+
+- **Panel and memory clocks.** The panel refreshes at ~65 Hz (`main/panel_rate.c` overrides the
+  board package's 80 MHz pixel clock, ~131 Hz): every refresh streams the 1 MB frame buffer out of
+  PSRAM, so the slower scan leaves that bandwidth to rendering. PSRAM runs at 250 MHz (chip
+  revision ≥ 3; checked by the boot memory test).
+- **Frame pacing.** Each frame picks the refresh it will appear at (from a running estimate of
+  its render time) and is drawn for exactly that instant; a presenter task hands it to the panel
+  during the refresh before, while the loop already draws the next one. Motion (the spin, glides,
+  inertia) therefore advances evenly; without it, frames shown for 4 or 5 refreshes alternately
+  made the spin judder.
+- **Shading.** The light is stored per pixel as 32 dithered levels and the product is dithered
+  again when it is truncated to RGB565 (and the twilight blend too): plain truncation biased the
+  shading in visible rings around the highlight.
+- **Pilot texture filtering.** Terrain tiles carry two mip levels (made when a tile is decoded);
+  each 2x2 block samples the level matching its ground footprint (geometric mean of the
+  across and along-view sizes) bilinearly, the global texture beyond. Point samples of a finer
+  texture made coastlines and ridges shimmer as the view moved. The graticule is antialiased and
+  the haze dithered. (The strips are
 kept small so the renderer's internal RAM coexists with the Wi-Fi/ESP-Hosted stack. They must
 be in the main SRAM: the P4's low-power SRAM also counts as internal RAM but is several times
 slower, so a strip there quarters the frame rate. The console and network task stacks live in
@@ -121,11 +144,13 @@ Frame rates (fps) measured with `tools/perf_test.py`:
 
 | View | still | panning |
 |---|---|---|
-| Earth spin | 12 | 18 |
-| Ground reference | 27 | 19–20 |
-| Satellite reference | 23 | 19 |
-| Pilot reference | 12–16 | 13–15 |
-| Flat earth | 24 | 15 |
+| Earth spin | 13 | 19–20 |
+| Ground reference | 30 | 21 |
+| Satellite reference | 20 | 19 |
+| Pilot reference | 13 | 12 |
+| Flat earth | 25 | 17 |
 
-The limit is the CPU: about 70–120 cycles per globe pixel on the two 400 MHz cores, with
-textures and per-pixel tables in PSRAM.
+(`perf_test.py --time 1792300000`, a fixed scene; the night side costs more, so other times
+differ.) Per frame on the busier core, globe pixels take ~50 ms in Earth spin and ~60 ms in the
+pilot view (CPU-bound: ~140 cycles a pixel, the per-pixel light table is only ~10 % of it), the
+vector layers ~12 ms (17 ms flat earth) and the copy out ~6 ms.

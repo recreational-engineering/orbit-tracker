@@ -11,7 +11,10 @@
 static const char *TAG = "tiles";
 
 #define NTILES HI_NTILES
-#define CACHE_N 24              // tiles per cache
+// Tiles per cache. Terrain tiles carry their mip levels (~340 KB each); a view has up to ~16
+// in sight. City lights are only looked up near the camera at night: a few at a time.
+#define CACHE_N 22
+static const int cache_n[2] = {CACHE_N, 14};
 #define IN_MAX (96 * 1024)      // largest compressed tile (a whole number of cache lines)
 #define FAR 1e30f               // "not wanted" / "not in view"
 
@@ -47,7 +50,8 @@ static int view_max[2], miss_max[2];
 
 static size_t tile_bytes(int kind)
 {
-    return kind == 0 ? HI_T * HI_T * 2 : LINE_UP(HI_T * HI_T) + (HI_T / 2) * (HI_T / 2);   // lights: level 0 + 1
+    // terrain: levels 0, 1, 2 (RGB565); lights: levels 0, 1 (grey)
+    return kind == 0 ? HI_T0_PX * 2 + HI_T1_PX * 2 + HI_T2_PX * 2 : LINE_UP(HI_T * HI_T) + (HI_T / 2) * (HI_T / 2);
 }
 
 // Both render cores call the lookups; a minimum lost between them only reorders loading.
@@ -78,7 +82,7 @@ const uint8_t *tiles_lights(int key, int level, float fp)
 static float victim(int kind, int *out)
 {
     int idle = -1, far = 0;
-    for (int i = 0; i < CACHE_N; i++) {
+    for (int i = 0; i < cache_n[kind]; i++) {
         const slot_t *s = &slots[kind][i];
         if (s->seen >= FAR) {
             if (idle < 0 || s->used < slots[kind][idle].used) idle = i;
@@ -104,7 +108,7 @@ void tiles_frame(void)
     // Close the frame: what each slot and each missing tile was used for becomes "last frame".
     for (int k = 0; k < 2; k++) {
         int nv = 0, nm = 0;
-        for (int i = 0; i < CACHE_N; i++) {
+        for (int i = 0; i < cache_n[k]; i++) {
             slots[k][i].seen = slots[k][i].near;
             slots[k][i].near = FAR;
             nv += slots[k][i].seen < FAR;
@@ -151,6 +155,22 @@ static void halve(const uint8_t *src, uint8_t *dst)
         }
 }
 
+// One RGB565 mip level: n x n -> n/2 x n/2, 2x2 box filter.
+static void mip565(const uint16_t *src, int n, uint16_t *dst)
+{
+    for (int y = 0; y < n / 2; y++) {
+        const uint16_t *a = src + 2 * y * n, *b = a + n;
+        uint16_t *o = dst + y * (n / 2);
+        for (int x = 0; x < n / 2; x++, a += 2, b += 2) {
+            uint32_t p0 = a[0], p1 = a[1], p2 = b[0], p3 = b[1];
+            uint32_t r = ((p0 >> 11) + (p1 >> 11) + (p2 >> 11) + (p3 >> 11) + 2) >> 2;
+            uint32_t g = (((p0 >> 5) & 63) + ((p1 >> 5) & 63) + ((p2 >> 5) & 63) + ((p3 >> 5) & 63) + 2) >> 2;
+            uint32_t bl = ((p0 & 31) + (p1 & 31) + (p2 & 31) + (p3 & 31) + 2) >> 2;
+            o[x] = (uint16_t)(r << 11 | g << 5 | bl);
+        }
+    }
+}
+
 static volatile int decoded;
 int tiles_decoded(void) { int n = decoded; decoded = 0; return n; }
 
@@ -175,6 +195,12 @@ static bool decode(int kind, int key, void *out)
     size_t cap = kind == 0 ? HI_T * HI_T * 2 : LINE_UP(HI_T * HI_T);
     if (jpeg_decoder_process(jpeg, &cfg, in_buf, len, out, cap, &out_size) != ESP_OK) return false;
     if (kind == 1) halve(out, (uint8_t *)out + LINE_UP(HI_T * HI_T));
+    else {
+        // Mip levels for the pilot view's filtered lookups (2x2 box filter, rounded).
+        uint16_t *l0 = out, *l1 = l0 + HI_T0_PX, *l2 = l1 + HI_T1_PX;
+        mip565(l0, HI_T, l1);
+        mip565(l1, HI_T / 2, l2);
+    }
     return true;
 }
 
@@ -249,7 +275,7 @@ void tiles_init(void)
     jpeg_decode_memory_alloc_cfg_t mc = {.buffer_direction = JPEG_DEC_ALLOC_INPUT_BUFFER};
     in_buf = jpeg_alloc_decoder_mem(IN_MAX, &mc, &in_cap);
     for (int k = 0; k < 2; k++) {
-        for (int i = 0; i < CACHE_N; i++) {
+        for (int i = 0; i < cache_n[k]; i++) {
             slots[k][i].key = -1;
             slots[k][i].used = 0;
             slots[k][i].near = slots[k][i].seen = FAR;

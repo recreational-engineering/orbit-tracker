@@ -48,7 +48,7 @@ static uint16_t *light_tab[2];
 static uint8_t *cover;
 #define SG_C 8
 #define SG_N (S / SG_C)
-static uint16_t shade_grid[2][SG_N * SG_N];
+static uint16_t *shade_grid[2];   // in PSRAM: 32 KB, read only for strokes on the globe
 // Earth spin: u (turn, 16 bit) | sqrt(1 - t²)·255 << 16 for t = Xs / cos(lat) in [-1, 1].
 #define SPIN_N 4096
 static uint32_t spin_lut[SPIN_N];
@@ -157,7 +157,8 @@ static uint16_t flat_light(float px, float py)
 
 // Lighting as stored per pixel: out = in · (m + 1) / 32 + add, with m in bits 0-4 and the
 // grey add as RGB565 components (5 bits in 5-9, 6 bits in 10-15). The multiplier and add are
-// dithered, so the 32 shading levels show no bands.
+// dithered here, and the product is dithered again when it is truncated to RGB565 (sw_light):
+// truncating without it biased the result in rings around the highlight.
 static uint16_t pack_light(uint16_t l, int x, int y)
 {
     float d = (BAYER4[y & 3][x & 3] + 0.5f) / 16.0f;
@@ -391,19 +392,36 @@ static inline __attribute__((always_inline)) uint32_t sw_sat_add(uint32_t x, uin
     return (s | (o - (o >> 5))) & SW_MASK;
 }
 
-static inline __attribute__((always_inline)) uint32_t sw_light(uint32_t x, uint16_t light)
+// Output dither: a second 4x4 Bayer pattern (shifted against the one in the light table),
+// 0 .. 31 in each spread field, added before the >> 5 of the light multiply.
+static uint32_t DQ[4][4];
+
+static void build_dither(void)
 {
-    x = ((x * ((light & 31) + 1)) >> 5) & SW_MASK;
-    uint32_t s5 = (light >> 5) & 31, s6 = light >> 10;
-    return sw_sat_add(x, s5 | s5 << 11 | s6 << 21);
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) {
+            uint32_t d = BAYER4[(y + 2) & 3][(x + 1) & 3] * 2 + 1;
+            DQ[y][x] = d | d << 11 | d << 21;
+        }
 }
 
-static inline uint16_t lit_pack(int r, int g, int b, uint16_t light)
+// The same threshold as a plain 0 .. 31 (twilight blend).
+static inline uint32_t dq5(uint32_t dq) { return dq & 31; }
+
+static inline __attribute__((always_inline)) uint32_t sw_light(uint32_t x, uint16_t light, uint32_t dq)
+{
+    x = ((x * ((light & 31) + 1) + dq) >> 5) & SW_MASK;
+    uint32_t s5 = (light >> 5) & 31, s6 = light >> 10;
+    return light >> 5 ? sw_sat_add(x, s5 | s5 << 11 | s6 << 21) : x;
+}
+
+// 8-bit colour lit to RGB565 (exact rim pixels).
+static inline uint16_t lit_pack(int r, int g, int b, uint16_t light, uint32_t dq)
 {
     if (r > 255) r = 255;
     if (g > 255) g = 255;
     if (b > 255) b = 255;
-    return UNSPREAD(sw_light(SPREAD(gfx_pack(r, g, b)), light));
+    return UNSPREAD(sw_light(SPREAD(gfx_pack(r, g, b)), light, dq));
 }
 
 // Night (integer): sun in Q12, L the city-light texel.
@@ -425,11 +443,11 @@ static inline void night_q(int *r, int *g, int *b, int sun, int L)
 static inline uint16_t tex0(int u, int v) { return texture[0][TEX_INDEX(u, v, TEX_W / 8)]; }
 
 // Night side on a spread pixel: blend toward RGB(4, 8, 28), then add the warm city lights.
-static inline __attribute__((always_inline)) uint32_t sw_night(uint32_t x, int sun, int L)
+static inline __attribute__((always_inline)) uint32_t sw_night(uint32_t x, int sun, int L, uint32_t d)
 {
     int k = sun - NIGHT_LO;
     if (k < 0) k = 0;
-    uint32_t a = night_a[k] >> 3;   // /32
+    uint32_t a = (night_a[k] + (dq5(d) >> 2)) >> 3;   // /32, dithered: no steps across the twilight band
     const uint32_t deep = SPREAD((4 >> 3) << 11 | (8 >> 2) << 5 | (28 >> 3));
     x = ((x * (32 - a) + deep * a) >> 5) & SW_MASK;
     int l = (L * night_n[k]) >> 8;
@@ -437,11 +455,11 @@ static inline __attribute__((always_inline)) uint32_t sw_night(uint32_t x, int s
     return x;
 }
 
-static inline __attribute__((always_inline)) uint16_t lit_px(uint16_t t, int sun, int lights_texel, uint16_t light)
+static inline __attribute__((always_inline)) uint16_t lit_px(uint16_t t, int sun, int lights_texel, uint16_t light, uint32_t dq)
 {
     uint32_t x = SPREAD(t);
-    if (sun < NIGHT_HI) x = sw_night(x, sun, lights_texel);
-    return UNSPREAD(sw_light(x, light));
+    if (sun < NIGHT_HI) x = sw_night(x, sun, lights_texel, dq);
+    return UNSPREAD(sw_light(x, light, dq));
 }
 
 // Antialiased disc edge: blend toward the face (or pilot background).
@@ -576,7 +594,7 @@ static inline uint16_t ortho_px_exact(const rctx_t *c, int x, int y)
     ortho_param(c, (x + 0.5f - CX) / R, (CY - y - 0.5f) / R, &p);
     ortho_color(c, &p, &r, &g, &b);
     int32_t i = row_off[y] + x - span_x0[y];
-    uint16_t px = lit_pack(r, g, b, light_tab[0][i]);
+    uint16_t px = lit_pack(r, g, b, light_tab[0][i], DQ[y & 3][x & 3]);
     return cover[i] < 255 ? edge_mix(px, face[y * S + x], cover[i]) : px;
 }
 
@@ -599,7 +617,7 @@ static inline void to_fixed(const gp_t *p, gq_t *q)
     q->z = (int32_t)(p->z * 255 * 256);
 }
 
-static inline __attribute__((always_inline)) uint16_t sample_px(const rctx_t *c, const gq_t *q, uint16_t light)
+static inline __attribute__((always_inline)) uint16_t sample_px(const rctx_t *c, const gq_t *q, uint16_t light, uint32_t d)
 {
     const int lev = c->level;
     int u = q->u >> (21 + lev), v = (q->v >> 8);
@@ -611,7 +629,7 @@ static inline __attribute__((always_inline)) uint16_t sample_px(const rctx_t *c,
         int lv = lod_z[q->z >> 8];
         L = lights[lv][(v >> lv) * (TEX_W >> lv) + (q->u >> (21 + lv))];
     }
-    return lit_px(t, q->sun, L, light);
+    return lit_px(t, q->sun, L, light, d);
 }
 
 // One row of samples at screen x = x0 + k·step (k < n), exact every SPAN samples and linear in
@@ -656,9 +674,10 @@ static void ortho_row_full(const rctx_t *c, int y)
     const int x0 = in_x0[y], n_ = in_x1[y] - x0;
     if (n_ <= 0) return;
     const uint16_t *lt = light_tab[0] + base + x0;
+    const uint32_t *drow = DQ[y & 3];
     uint16_t *out = row + x0;
 #define XF(k) (x0 + (k) + 0.5f)
-#define PUTF(k, q) out[k] = sample_px(c, &(q), lt[k])
+#define PUTF(k, q) out[k] = sample_px(c, &(q), lt[k], drow[(x0 + (k)) & 3])
     SAMPLE_ROW(XF, PUTF);
 #undef XF
 #undef PUTF
@@ -678,9 +697,10 @@ static void ortho_rows_half(const rctx_t *c, int by)
     // Every block from one sample (2x2 pixels); the blocks on the disc edge are then blended
     // into the face per pixel by its coverage.
     const uint16_t *lt = hlight_tab[0] + base + bx0;
+    const uint32_t *drow = DQ[by & 3];   // dither per 2x2 block
     uint32_t *o0 = (uint32_t *)(row0 + 2 * bx0), *o1 = (uint32_t *)(row1 + 2 * bx0);   // 2 px each, aligned
 #define XH(k) (2 * (bx0 + (k)) + 1.0f)
-#define PUTH(k, q) do { uint32_t px_ = sample_px(c, &(q), lt[k]); px_ |= px_ << 16; o0[k] = px_; o1[k] = px_; } while (0)
+#define PUTH(k, q) do { uint32_t px_ = sample_px(c, &(q), lt[k], drow[(bx0 + (k)) & 3]); px_ |= px_ << 16; o0[k] = px_; o1[k] = px_; } while (0)
     SAMPLE_ROW(XH, PUTH);
 #undef XH
 #undef PUTH
@@ -722,7 +742,7 @@ static uint16_t axis_px(const rctx_t *c, bool flat, int x, int y, int32_t i)
     }
     int L = 0;
     if (sun < NIGHT_HI) { int w = TEX_W >> level; L = lights[level][(v >> level) * w + (uf >> (5 + level))]; }
-    uint16_t px = lit_px(tex0(u, v), sun, L, light_tab[flat][i]);
+    uint16_t px = lit_px(tex0(u, v), sun, L, light_tab[flat][i], DQ[y & 3][x & 3]);
     return cover[i] < 255 ? edge_mix(px, face[y * S + x], cover[i]) : px;
 }
 
@@ -759,6 +779,7 @@ static inline __attribute__((always_inline)) void spin_inner(const rctx_t *c, in
     int32_t tq = (int32_t)(((x0 - CX) / (R * cr) + 1) * kq + 32768), dtq = (int32_t)(kq / (R * cr)) * step;
     const int crq = (int)(cr * 256 + 0.5f);
     const uint16_t *lt = light_tab[0] + base;
+    const uint32_t *drow = DQ[y & 3];
     const uint32_t uoff = c->uoff;
     const int xe = in_x1[y];
     for (int x = in_x0[y]; x < xe; x += step, xq += dxq, tq += dtq) {
@@ -768,9 +789,10 @@ static inline __attribute__((always_inline)) void spin_inner(const rctx_t *c, in
         int z = ((t >> 16) * crq) >> 8;
         uint32_t u = uf >> 5, px = SPREAD(trow[(u & ~7u) << 3 | (u & 7)]);
         int sun = ((z * Pz) >> 8) + (xq >> 8) + rowq;
-        if (__builtin_expect(sun < NIGHT_HI, 0)) { int lv = lod_z[z]; px = sw_night(px, sun, lrow[lv][uf >> (5 + lv)]); }
+        uint32_t d = drow[x & 3];
+        if (__builtin_expect(sun < NIGHT_HI, 0)) { int lv = lod_z[z]; px = sw_night(px, sun, lrow[lv][uf >> (5 + lv)], d); }
         uint32_t l = lt[x];
-        px = ((px * ((l & 31) + 1)) >> 5) & SW_MASK;
+        px = ((px * ((l & 31) + 1) + d) >> 5) & SW_MASK;
         if (l >> 5) { uint32_t s5 = (l >> 5) & 31, s6 = l >> 10; px = sw_sat_add(px, s5 | s5 << 11 | s6 << 21); }
         uint16_t o = UNSPREAD(px);
         row[x] = o;
@@ -797,9 +819,11 @@ static inline __attribute__((always_inline)) void flat_inner(const rctx_t *c, in
     const int Pq = (int)lrintf(c->P * k8), Qq = (int)lrintf(c->Q * k8), Sq = (int)lrintf(c->sz * k8);
     const uint32_t *ta = axis_tab[1] + base, *nr = flat_nrm + base;
     const uint16_t *lt = light_tab[1] + base;
+    const uint32_t *drow = DQ[y & 3];
     const uint32_t uoff = c->uoff;
     const int xe = in_x1[y];
     for (int x = in_x0[y]; x < xe; x += step) {
+        uint32_t d = drow[x & 3];
         uint32_t t = ta[x], uf = (t + uoff) & 0xFFFF, nn = nr[x];
         int u = uf >> 5, v = (t >> 16) & 1023;
         int sun = ((int8_t)nn * Pq + (int8_t)(nn >> 8) * Qq + (int8_t)(nn >> 16) * Sq) >> 8;
@@ -808,10 +832,10 @@ static inline __attribute__((always_inline)) void flat_inner(const rctx_t *c, in
         uint32_t px = SPREAD(v < FLAT_MIP_V ? texture[1][TEX_INDEX(u >> 1, v >> 1, TEX_W / 16)] : tex0(u, v));
         if (__builtin_expect(sun < NIGHT_HI, 0)) {   // lights footprint ≈ 65 km, coarser near the pole
             int L = v < FLAT_MIP_V ? lights[3][(v >> 3) * (TEX_W / 8) + (uf >> 8)] : lights[2][(v >> 2) * (TEX_W / 4) + (uf >> 7)];
-            px = sw_night(px, sun, L);
+            px = sw_night(px, sun, L, d);
         }
         uint32_t l = lt[x];
-        px = ((px * ((l & 31) + 1)) >> 5) & SW_MASK;
+        px = ((px * ((l & 31) + 1) + d) >> 5) & SW_MASK;
         if (l >> 5) { uint32_t s5 = (l >> 5) & 31, s6 = l >> 10; px = sw_sat_add(px, s5 | s5 << 11 | s6 << 21); }
         uint16_t o = UNSPREAD(px);
         row[x] = o;
@@ -891,34 +915,98 @@ static void pilot_ray(const rctx_t *c, float Xs, float Ys, pp_t *o)
     o->fp = t * c->pix_ang / (cosi > 0.15f ? cosi : 0.15f);
 }
 
-// Ground colour, in packed RGB565 integer steps: texel (high-res tile near the camera), night
-// with city lights, graticule, aerial haze.
-static void pilot_shade(const rctx_t *c, pp_t *p)
+// Filtered texture lookups for the pilot view. Each 2x2 block shows one sample, so a point
+// sample of a texture finer than the block flickers as the view moves (coastlines, ridges):
+// the level is chosen by the block's ground footprint and sampled bilinearly.
+#define SW_RND (16u | 16u << 11 | 16u << 21)   // +0.5 in each spread field before >> 5
+
+// Bilinear in an n x n RGB565 image at (x, y) in its texels (centres at +0.5), clamped at the
+// edges; returns a spread pixel.
+static inline uint32_t bil565(const uint16_t *img, int n, float x, float y)
 {
+    x -= 0.5f; y -= 0.5f;
+    x = x < 0 ? 0 : x > n - 1 ? n - 1 : x;
+    y = y < 0 ? 0 : y > n - 1 ? n - 1 : y;
+    int x0 = (int)x, y0 = (int)y, x1 = x0 + (x0 < n - 1), y1 = y0 + (y0 < n - 1);
+    uint32_t wx = (uint32_t)((x - x0) * 32), wy = (uint32_t)((y - y0) * 32);
+    const uint16_t *r0 = img + y0 * n, *r1 = img + y1 * n;
+    uint32_t top = ((SPREAD(r0[x0]) * (32 - wx) + SPREAD(r0[x1]) * wx + SW_RND) >> 5) & SW_MASK;
+    uint32_t bot = ((SPREAD(r1[x0]) * (32 - wx) + SPREAD(r1[x1]) * wx + SW_RND) >> 5) & SW_MASK;
+    return ((top * (32 - wy) + bot * wy + SW_RND) >> 5) & SW_MASK;
+}
+
+// The same for an n x n grey image.
+static inline int bil8(const uint8_t *img, int n, float x, float y)
+{
+    x -= 0.5f; y -= 0.5f;
+    x = x < 0 ? 0 : x > n - 1 ? n - 1 : x;
+    y = y < 0 ? 0 : y > n - 1 ? n - 1 : y;
+    int x0 = (int)x, y0 = (int)y, x1 = x0 + (x0 < n - 1), y1 = y0 + (y0 < n - 1);
+    int wx = (int)((x - x0) * 256), wy = (int)((y - y0) * 256);
+    const uint8_t *r0 = img + y0 * n, *r1 = img + y1 * n;
+    int top = r0[x0] * (256 - wx) + r0[x1] * wx, bot = r1[x0] * (256 - wx) + r1[x1] * wx;
+    return (top * (256 - wy) + bot * wy + 32768) >> 16;
+}
+
+// Global texture level lev (0: 2048 x 1024, 1: half), bilinear, wrapping east-west.
+static inline uint32_t bil_global(int lev, float fu, float fvn)
+{
+    const int w = TEX_W >> lev, h = TEX_H >> lev, tx = (TEX_W / 8) >> lev;
+    float gu = fu * w - 0.5f, gv = fvn * h - 0.5f;
+    int u0 = (int)floorf(gu), v0 = (int)floorf(gv);
+    uint32_t wu = (uint32_t)((gu - u0) * 32), wv = (uint32_t)((gv - v0) * 32);
+    if (u0 < 0) u0 += w;
+    int u1 = u0 + 1 < w ? u0 + 1 : 0, v1 = v0 + 1 < h ? v0 + 1 : h - 1;
+    if (v0 < 0) v0 = 0;
+    const uint16_t *t = texture[lev];
+    uint32_t top = ((SPREAD(t[TEX_INDEX(u0, v0, tx)]) * (32 - wu) + SPREAD(t[TEX_INDEX(u1, v0, tx)]) * wu + SW_RND) >> 5) & SW_MASK;
+    uint32_t bot = ((SPREAD(t[TEX_INDEX(u0, v1, tx)]) * (32 - wu) + SPREAD(t[TEX_INDEX(u1, v1, tx)]) * wu + SW_RND) >> 5) & SW_MASK;
+    return ((top * (32 - wv) + bot * wv + SW_RND) >> 5) & SW_MASK;
+}
+
+// City-light level lev of the global mip chain, bilinear.
+static inline int bil_global_lights(int lev, float fu, float fvn)
+{
+    int w = TEX_W >> lev, h = TEX_H >> lev;
+    float gu = fu * w - 0.5f, gv = fvn * h - 0.5f;
+    int u0 = (int)floorf(gu), v0 = (int)floorf(gv);
+    int wu = (int)((gu - u0) * 256), wv = (int)((gv - v0) * 256);
+    if (u0 < 0) u0 += w;
+    int u1 = u0 + 1 < w ? u0 + 1 : 0, v1 = v0 + 1 < h ? v0 + 1 : h - 1;
+    if (v0 < 0) v0 = 0;
+    const uint8_t *l0 = lights[lev] + v0 * w, *l1 = lights[lev] + v1 * w;
+    int top = l0[u0] * (256 - wu) + l0[u1] * wu, bot = l1[u0] * (256 - wu) + l1[u1] * wu;
+    return (top * (256 - wv) + bot * wv + 32768) >> 16;
+}
+
+// Ground colour, in packed RGB565 integer steps: terrain (high-res tile levels near the camera,
+// the global texture beyond), night with city lights, graticule, aerial haze. dq: the block's
+// ordered-dither threshold (DQ).
+static void pilot_shade(const rctx_t *c, pp_t *p, uint32_t dq)
+{
+    const uint32_t d = dq5(dq) << 3;   // the same threshold, Q8
     float fu = p->fu + 2;
     fu -= (float)(int)fu;
     float fvn = fminf(0.9999f, fmaxf(0, p->fv * (1.0f / TEX_H)));
-    int key = -1, tx = 0, ty = 0;
+    // Ground footprint of the 2x2 block and the texture level that matches it. Toward the
+    // horizon the footprint is long in depth only (fp, stretched by 1 / cos incidence) and one
+    // pixel across: their geometric mean picks the level, as the longer side alone would blur.
+    const float q = p->t * c->pix_ang * p->fp, sfp = 2 * q * rsqrt_fast(fmaxf(q, 1e-6f)), T = HI_TEXEL_KM;
+    const int tl = sfp < 2 * T ? 0 : sfp < 4 * T ? 1 : sfp < 8 * T ? 2 : -1;
+    int key = -1;
+    float fx = 0, fy = 0;
     const uint16_t *tile = NULL;
-    if (p->t < c->hi_max_t) {   // high-res tile where the ground is near enough
-        key = tiles_key(fu, fvn, &tx, &ty);
+    if (tl >= 0 && p->t < c->hi_max_t) {
+        key = tiles_key_f(fu, fvn, &fx, &fy);
         tile = tiles_terrain(key, p->fp);
     }
     uint32_t x;
     if (tile) {
-        x = SPREAD(tile[ty * HI_T + tx]);
+        const uint16_t *lv = tile + (tl == 0 ? 0 : tl == 1 ? HI_T0_PX : HI_T0_PX + HI_T1_PX);
+        const float sc = tl == 0 ? 1 : tl == 1 ? 0.5f : 0.25f;
+        x = bil565(lv, HI_T >> tl, fx * sc, fy * sc);
     } else {
-        // Global texture, bilinear: its texels (~20 km) span many pixels near the camera.
-        float gu = fu * TEX_W - 0.5f, gv = fvn * TEX_H - 0.5f;
-        int u0 = (int)floorf(gu), v0 = (int)floorf(gv);
-        int wu = (int)((gu - u0) * 32), wv = (int)((gv - v0) * 32);
-        if (u0 < 0) u0 += TEX_W;
-        int u1 = u0 + 1 < TEX_W ? u0 + 1 : 0;
-        int v1 = v0 + 1 < TEX_H ? v0 + 1 : TEX_H - 1;
-        if (v0 < 0) v0 = 0;
-        uint32_t top = (SPREAD(tex0(u0, v0)) * (32 - wu) + SPREAD(tex0(u1, v0)) * wu) >> 5 & SW_MASK;
-        uint32_t bot = (SPREAD(tex0(u0, v1)) * (32 - wu) + SPREAD(tex0(u1, v1)) * wu) >> 5 & SW_MASK;
-        x = (top * (32 - wv) + bot * wv) >> 5 & SW_MASK;
+        x = bil_global(sfp > 2 * LIGHT_TEXEL_KM ? 1 : 0, fu, fvn);
     }
     const int sunq = (int)(p->sun * 4096);
     int litq = 256;   // day side, for the haze colour
@@ -926,39 +1014,35 @@ static void pilot_shade(const rctx_t *c, pp_t *p)
         int k = sunq - NIGHT_LO;
         if (k < 0) k = 0;
         litq = 256 - night_n[k];
-        // Lights level of detail by footprint: tile (≤ 5 km), its half mip (≤ 10 km), else global.
+        // City lights: tile levels 0 / 1 near the camera, else the global mip chain.
         int L = -1;
-        if (key >= 0 && p->fp < 10) {
-            const uint8_t *lt = tiles_lights(key, p->fp < 5 ? 0 : 1, p->fp);
-            if (lt) L = p->fp < 5 ? lt[ty * HI_T + tx] : lt[(ty >> 1) * (HI_T / 2) + (tx >> 1)];
+        const int ll = sfp < 2 * T ? 0 : sfp < 4 * T ? 1 : -1;
+        if (ll >= 0) {
+            if (key < 0) key = tiles_key_f(fu, fvn, &fx, &fy);
+            const uint8_t *lt = tiles_lights(key, ll, p->fp);
+            if (lt) L = ll ? bil8(lt, HI_T / 2, fx * 0.5f, fy * 0.5f) : bil8(lt, HI_T, fx, fy);
         }
         if (L < 0) {
-            float ratio = p->fp * (1.0f / LIGHT_TEXEL_KM);
-            int lv = ratio <= 1 ? 0 : ratio <= 2 ? 1 : ratio <= 4 ? 2 : 3;
-            // Bilinear, as the terrain fallback: near the camera a texel spans many pixels.
-            int w = TEX_W >> lv, h = TEX_H >> lv;
-            float gu = fu * w - 0.5f, gv = fvn * h - 0.5f;
-            int u0 = (int)floorf(gu), v0 = (int)floorf(gv);
-            int wu = (int)((gu - u0) * 256), wv = (int)((gv - v0) * 256);
-            if (u0 < 0) u0 += w;
-            int u1 = u0 + 1 < w ? u0 + 1 : 0;
-            int v1 = v0 + 1 < h ? v0 + 1 : h - 1;
-            if (v0 < 0) v0 = 0;
-            const uint8_t *l0 = lights[lv] + v0 * w, *l1 = lights[lv] + v1 * w;
-            int top = l0[u0] * (256 - wu) + l0[u1] * wu, bot = l1[u0] * (256 - wu) + l1[u1] * wu;
-            L = (top * (256 - wv) + bot * wv) >> 16;
+            float ratio = sfp * (1.0f / LIGHT_TEXEL_KM);
+            L = bil_global_lights(ratio <= 2 ? 0 : ratio <= 4 ? 1 : ratio <= 8 ? 2 : 3, fu, fvn);
         }
-        x = sw_night(x, sunq, L);
+        x = sw_night(x, sunq, L, dq);
     }
-    // Graticule every 10°, line width about one pixel's footprint on the ground.
-    float fpd = p->t * c->pix_ang * (57.29578f * 0.8f / EARTH_R_KM);
+    // Graticule every 10°, about one pixel wide, antialiased: blended by how close the block's
+    // centre is to the line (a hard on/off line crawls as the view moves).
+    float fpd = p->t * c->pix_ang * (57.29578f / EARTH_R_KM);   // one pixel, in degrees
     float la = 90 - fvn * 180, lo = fu * 360 - 180;
     float dlat = fabsf(la - (float)((int)(la * 0.1f + 100.5f) - 100) * 10);
     float dlon = fabsf(lo - (float)((int)(lo * 0.1f + 100.5f) - 100) * 10) * p->cl;
-    if (dlat < fpd || dlon < fpd) x = sw_sat_add(((x * 26) >> 5) & SW_MASK, SPREAD((51 >> 3) << 11 | (51 >> 2) << 5 | (51 >> 3)));
-    // Aerial haze toward the horizon.
+    float dm = fminf(dlat, dlon), w = 1.5f * fpd;
+    if (dm < w) {   // (rarely true: the division only near a line)
+        float cov = 1 - dm / w;
+        uint32_t a = (uint32_t)(cov * 7 + (d >> 5) * (1.0f / 8));   // up to ~0.2 toward light grey
+        if (a) x = ((x * (32 - a) + SPREAD(gfx_pack(225, 230, 235)) * a) >> 5) & SW_MASK;
+    }
+    // Aerial haze toward the horizon (dithered: 32 steps would band).
     float hq = fminf(1, p->t * c->inv_t_horizon), hq2 = hq * hq;
-    int a = (int)(19.2f * hq2 * hq2 * hq + 0.5f);   // 0.6 · hq⁵ · 32
+    int a = (int)(19.2f * hq2 * hq2 * hq + d * (1.0f / 256));   // 0.6 · hq⁵ · 32
     if (a) {
         uint32_t hc = SPREAD(gfx_pack(12 + (120 * litq >> 8), 18 + (160 * litq >> 8), 40 + (210 * litq >> 8)));
         x = ((x * (32 - a) + hc * a) >> 5) & SW_MASK;
@@ -1030,7 +1114,7 @@ static void pilot_rows_half(const rctx_t *c, int by)
             } else {
                 pilot_ray(c, (x + 1.0f - CX) * inv_c, Ys, &p);
             }
-            if (p.ground) pilot_shade(c, &p);
+            if (p.ground) pilot_shade(c, &p, DQ[by & 3][bx & 3]);
             uint16_t px = pilot_finish(&p, x + 1.0f, y0 + 1.0f);
             float dxc = fmaxf(fabsf(x + 0.5f - CX), fabsf(x + 1.5f - CX));
             if (dxc * dxc <= hin2) {
@@ -1223,6 +1307,7 @@ void globe_init(void)
     }
     face = heap_caps_malloc(S * S * 2, MALLOC_CAP_SPIRAM);
     build_luts();
+    build_dither();
     int64_t t0 = esp_timer_get_time();
     build_static_layers();
     ESP_LOGI(TAG, "static layers built in %lld ms", (esp_timer_get_time() - t0) / 1000);
@@ -1235,7 +1320,8 @@ void globe_init(void)
     pool_init(&bg_pool, "globe_b", 0, 2, 4096);
     xTaskCreatePinnedToCore(bg_task_fn, "globe_bg", 4096, NULL, 3, &bg_task, 1);
     tiles_init();
-    // Light per 8x8 pixel cell in internal RAM, for colouring the strokes printed on the globe.
+    // Light per 8x8 pixel cell, for colouring the strokes printed on the globe.
+    for (int k = 0; k < 2; k++) shade_grid[k] = heap_caps_malloc(SG_N * SG_N * 2, MALLOC_CAP_SPIRAM);
     for (int k = 0; k < 2; k++)
         for (int cy = 0; cy < SG_N; cy++)
             for (int cx = 0; cx < SG_N; cx++) {

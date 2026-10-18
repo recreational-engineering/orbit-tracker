@@ -27,10 +27,12 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "gfx.h"
 #include "scene.h"
 #include "tiles.h"
+#include "panel_rate.h"
 #include "net.h"
 #include "nvs_flash.h"
 #include "generated/elements.h"
@@ -105,16 +107,20 @@ static void flash_check(const uint16_t *fb, bool half)
 static struct { volatile bool pending; int x0, y0, x1, y1, ms; } sim;
 static struct { bool active; int64_t start; int x0, y0, x1, y1, ms, phase; } sim_run;
 
-// Three frame buffers, drawn round robin: the panel scans one, the last one handed over waits
-// for the end of the current refresh, the third is drawn. At the end of each refresh the
-// panel starts on the last buffer handed over.
+// Three frame buffers, drawn round robin: the panel scans one, a finished one waits for its
+// refresh slot (the presenter task hands it over then), the third is drawn. At the end of each
+// refresh the panel starts on the last buffer handed over.
 #define NFB 3
-static volatile int fb_submitted, fb_scanning;
+static volatile int fb_submitted, fb_scanning, fb_pending = -1;
+static void *fbs[NFB];
 
 // Panel refresh health: a refresh that ends much later than the 60 Hz period means the panel's
 // DMA was restarted late and it showed a broken frame (seen as a white flash).
 static volatile uint32_t refresh_late, refresh_max_us;
 static volatile int64_t refresh_last;
+static volatile uint32_t refresh_count;   // refreshes completed (each one starts the next)
+static TaskHandle_t presenter;
+static volatile int missed;               // frames that appeared after their target refresh
 
 static bool IRAM_ATTR on_frame_buf_complete(esp_lcd_panel_handle_t p, esp_lcd_dpi_panel_event_data_t *e, void *ctx)
 {
@@ -122,13 +128,35 @@ static bool IRAM_ATTR on_frame_buf_complete(esp_lcd_panel_handle_t p, esp_lcd_dp
     if (refresh_last) {
         uint32_t d = (uint32_t)(t - refresh_last);
         if (d > refresh_max_us) refresh_max_us = d;
-        if (d > 12000) refresh_late++;   // 1.5 periods of the ~126 Hz refresh
+        if (d > PANEL_REFRESH_US * 3 / 2) refresh_late++;   // 1.5 refresh periods
     }
     refresh_last = t;
+    refresh_count++;
     fb_scanning = fb_submitted;
     BaseType_t woken = pdFALSE;
     xSemaphoreGiveFromISR(fb_released, &woken);
+    if (presenter) vTaskNotifyGiveFromISR(presenter, &woken);
     return woken == pdTRUE;
+}
+
+// Frame pacing, the hand-over half: a finished frame is given to the panel during the refresh
+// before its target, so it appears exactly at the instant it was drawn for. A task of its own,
+// so the frame loop starts on the next frame meanwhile instead of waiting.
+typedef struct { int fb; uint32_t target; } present_t;
+static QueueHandle_t present_q;
+
+static void presenter_task(void *arg)
+{
+    present_t f;
+    for (;;) {
+        xQueueReceive(present_q, &f, portMAX_DELAY);
+        while ((int32_t)(refresh_count - (f.target - 1)) < 0) ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+        esp_lcd_panel_draw_bitmap(panel, 0, 0, GFX_W, GFX_H, fbs[f.fb]);
+        fb_submitted = f.fb;
+        if ((int32_t)(refresh_count - f.target) >= 0) missed++;
+        fb_pending = -1;
+        xSemaphoreGive(fb_released);   // the frame loop may be waiting to queue the next one
+    }
 }
 
 static double now_unix(void)
@@ -265,7 +293,6 @@ void app_main(void)
 
     esp_lcd_panel_io_handle_t io;
     ESP_ERROR_CHECK(bsp_display_new(NULL, &panel, &io));
-    void *fbs[NFB];
     ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(panel, NFB, &fbs[0], &fbs[1], &fbs[2]));
     fb_released = xSemaphoreCreateBinary();
     esp_lcd_dpi_panel_event_callbacks_t cbs = {.on_frame_buf_complete = on_frame_buf_complete};
@@ -284,6 +311,16 @@ void app_main(void)
     int64_t last_present = 0;
     scene_timing_t sum = {0}, tm;
     int64_t last = esp_timer_get_time(), stats_at = last;
+    // Frame pacing: a frame handed over during refresh n - 1 is on screen from the end of it
+    // (refresh_count == n). Each frame aims at the first such boundary after its expected render
+    // time and is drawn for exactly that moment; finished early, it is held back to that
+    // refresh. So every frame shows the scene at the instant it appears, and motion (the spin,
+    // glides, inertia) advances evenly instead of by the jittery render time.
+    float work_us = 60000;      // render time estimate (rises fast, decays slowly)
+    uint32_t last_target = 0;
+    int last_fb = 0;
+    present_q = xQueueCreate(1, sizeof(present_t));
+    xTaskCreatePinnedToCore(presenter_task, "present", 3072, NULL, 6, &presenter, 0);
     bool was_pressed = false;
     bool dark = false;          // standby: backlight off, no rendering
     bool swallow = false;       // the touch that woke the display is not passed on as a tap
@@ -313,9 +350,18 @@ void app_main(void)
             ESP_LOGI(TAG, "standby: display on (%s)", touched ? "touch" : "morning");
         }
         int64_t now = esp_timer_get_time();
-        float dt = (now - last) / 1e6f;
-        last = now;
-        int64_t ms = now / 1000;
+        const uint32_t rc = refresh_count;
+        const int64_t rl = refresh_last ? refresh_last : now;
+        // The boundary this frame will appear at: after the render, and never before or at the
+        // previous frame's.
+        uint32_t target = rc + 1 + (uint32_t)((now - rl + (int64_t)work_us) / PANEL_REFRESH_US);
+        if ((int32_t)(target - last_target) <= 0) target = last_target + 1;
+        const int64_t show = rl + (int64_t)(target - rc) * PANEL_REFRESH_US;
+        float dt = (show - last) / 1e6f;
+        if (dt < 0) dt = 0;
+        last = show;
+        int64_t ms = show / 1000;
+        const double show_unix = now_unix() + (show - now) / 1e6;
 
         if (sim.pending) {
             sim.pending = false;
@@ -356,20 +402,24 @@ void app_main(void)
             ESP_LOGI(TAG, "standby: display off");
             continue;
         }
-        if (clock_changed) { clock_changed = false; scene_clock_changed(now_unix()); }
-        scene_update(now_unix(), dt, ms);
+        if (clock_changed) { clock_changed = false; scene_clock_changed(show_unix); }
+        scene_update(show_unix, dt, ms);
 
-        // The next buffer round robin is free unless two frames were handed over within one
-        // refresh (then the panel still scans it): wait for the refresh to end.
-        int back = (fb_submitted + 1) % NFB;
-        while (back == fb_scanning) {
-            xSemaphoreTake(fb_released, 0);
-            if (back == fb_scanning) xSemaphoreTake(fb_released, pdMS_TO_TICKS(40));
-        }
+        // The next buffer round robin is free once the panel no longer scans it and it is not
+        // the one waiting for its slot.
+        int back = (last_fb + 1) % NFB;
+        while (back == fb_scanning || back == fb_pending) xSemaphoreTake(fb_released, pdMS_TO_TICKS(40));
         uint16_t *fb = fbs[back];
         scene_render(fb, &tm);
-        esp_lcd_panel_draw_bitmap(panel, 0, 0, GFX_W, GFX_H, fb);
-        fb_submitted = back;
+        float took = (float)(esp_timer_get_time() - now);
+        work_us = took > work_us ? 0.5f * (work_us + took) + 1000 : 0.97f * work_us + 0.03f * took;
+        // One frame waits for its slot at a time; the presenter hands it over.
+        while (fb_pending >= 0) xSemaphoreTake(fb_released, pdMS_TO_TICKS(40));
+        fb_pending = back;
+        last_fb = back;
+        last_target = target;
+        present_t pf = {back, target};
+        xQueueSend(present_q, &pf, portMAX_DELAY);
         if (flash_watch) flash_check(fb, tm.half_res);
         else if (fw_frames) {
             ESP_LOGI(TAG, "flash monitor: %d frames, %d suspicious", fw_frames, fw_glitches);
@@ -394,6 +444,7 @@ void app_main(void)
         if (tm.total_ms > worst_ms) worst_ms = tm.total_ms;
         sum.base_ms += tm.base_ms; sum.lines_ms += tm.lines_ms; sum.overlay_ms += tm.overlay_ms;
         sum.total_ms += tm.total_ms;
+        sum.px_ms += tm.px_ms; sum.replay_ms += tm.replay_ms; sum.copy_ms += tm.copy_ms;
         if (want_stats || (!stats_on_demand && now - stats_at > 5000000)) {
             want_stats = false;
             float secs = (now - stats_at) / 1e6f;
@@ -403,14 +454,15 @@ void app_main(void)
             int redraws;
             float redraw_ms;
             scene_globe_stats(&redraws, &redraw_ms);
-            ESP_LOGI(TAG, "STATS %s %.1f fps | gap max %.0f ms | frame %.1f ms, worst %.1f (record %.1f, strips %.1f, overlay %.1f) | "
+            ESP_LOGI(TAG, "STATS %s %.1f fps | gap max %.0f ms | frame %.1f ms, worst %.1f (record %.1f, strips %.1f: px %.1f replay %.1f copy %.1f) | "
                      "half-res %d/%d | full-res renders %d x %.0f ms",
                      scene_mode_name(), frames / secs, worst_gap_ms, sum.total_ms / frames, worst_ms, sum.base_ms / frames, sum.lines_ms / frames,
-                     sum.overlay_ms / frames, half_frames, frames, redraws, redraw_ms);
+                     sum.px_ms / frames, sum.replay_ms / frames, sum.copy_ms / frames, half_frames, frames, redraws, redraw_ms);
             int tv[2], tmiss[2];
             tiles_stats(tv, tmiss);
-            ESP_LOGI(TAG, "PANEL refresh max %.1f ms, late refreshes %lu, tile decodes %d, tiles in view %d+%d, missing %d+%d",
-                     refresh_max_us / 1000.0f, (unsigned long)refresh_late, tiles_decoded(), tv[0], tv[1], tmiss[0], tmiss[1]);
+            ESP_LOGI(TAG, "PANEL refresh max %.1f ms, late refreshes %lu, frames off target %d, strips %s, tile decodes %d, tiles in view %d+%d, missing %d+%d",
+                     refresh_max_us / 1000.0f, (unsigned long)refresh_late, missed, scene_strips_fast() ? "fast" : "SLOW RAM", tiles_decoded(), tv[0], tv[1], tmiss[0], tmiss[1]);
+            missed = 0;
             refresh_max_us = 0;
             refresh_late = 0;
             ESP_LOGI(TAG, "SAT t=%.0f %s lat=%.3f lon=%.3f alt=%.1f rot=[%.2f %.2f %.2f]", now_unix(),

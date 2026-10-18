@@ -13,6 +13,7 @@
 #include <string.h>
 #include <time.h>
 #include "dlist.h"
+#include "esp_memory_utils.h"
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -1634,21 +1635,31 @@ static void record(int part, const void *vctx)
     if (st.menu_open) draw_menu();
 }
 
+// Time per core in the last frame's strips: globe pixels, vector replay, copy out (µs).
+static int64_t strip_us[2][3];
+
 // The frame in strips of internal RAM, each core taking every other strip.
 static void frame_strips(int part, const void *vctx)
 {
     const frame_job_t *j = vctx;
     uint16_t *sb = strip_buf[part];
     if (!sb) return;   // out of internal RAM at start-up: skip rather than write through NULL
+    int64_t *acc = strip_us[part];
+    acc[0] = acc[1] = acc[2] = 0;
     for (int k = part; k < DL_NSTRIPS; k += 2) {
         int y0 = k * DL_STRIP_H, y1 = y0 + DL_STRIP_H < S ? y0 + DL_STRIP_H : S;
         uint16_t *fbv = sb - y0 * S;   // frame coordinates for this strip's rows
+        int64_t t0 = esp_timer_get_time();
         if (j->base) memcpy(sb, j->base + y0 * S, (y1 - y0) * S * 2);
         else globe_rows(fbv, &j->gv, y0, y1, j->half);
+        int64_t t1 = esp_timer_get_time();
         gfx_target(fbv);
         gfx_clip_rows(y0, y1);
         dl_replay(k);
+        int64_t t2 = esp_timer_get_time();
         strip_out(j->fb, sb, y0, y1 - y0);
+        int64_t t3 = esp_timer_get_time();
+        acc[0] += t1 - t0; acc[1] += t2 - t1; acc[2] += t3 - t2;
     }
     gfx_clip_rows(0, S);
 }
@@ -1730,6 +1741,10 @@ void scene_render(uint16_t *fb, scene_timing_t *tm)
         tm->base_ms = (t1 - t0) / 1000.0f;    // record the display list
         tm->lines_ms = (t2 - t1) / 1000.0f;   // strips: pixels, replay, copy out
         tm->overlay_ms = 0;
+        int busy = strip_us[1][0] + strip_us[1][1] + strip_us[1][2] > strip_us[0][0] + strip_us[0][1] + strip_us[0][2];
+        tm->px_ms = strip_us[busy][0] / 1000.0f;
+        tm->replay_ms = strip_us[busy][1] / 1000.0f;
+        tm->copy_ms = strip_us[busy][2] / 1000.0f;
         tm->total_ms = (t2 - t0) / 1000.0f;
         tm->half_res = job.half;
     }
@@ -1765,6 +1780,13 @@ void scene_init(void)
     st.spin_t0 = esp_timer_get_time() / 1000;   // boot into Earth spin
     scene_reserve_strips();
     ESP_LOGI("scene", "internal RAM free %u after strips", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+}
+
+bool scene_strips_fast(void)
+{
+    for (int i = 0; i < 2; i++)
+        if (!strip_buf[i] || !esp_ptr_dma_capable(strip_buf[i])) return false;
+    return true;
 }
 
 void scene_reserve_strips(void)
