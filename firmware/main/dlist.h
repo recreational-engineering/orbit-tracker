@@ -21,6 +21,11 @@ void dl_replay(int strip);
 int dl_count(void);
 
 void dl_thin(float x0, float y0, float x1, float y1, float w, rgb_t c, float a, const gfx_dash_t *dash);
+// Hairlines of the surface line sets (one core, before anything else is recorded): a set of
+// shared stroke parameters (dashes on / off, on = 0: solid), then its segments with the dash
+// position at their start. They are drawn before every other item.
+int dl_hair_set(float w, float a, float on, float off);
+void dl_hair(int set, float x0, float y0, float x1, float y1, rgb_t c, float dash_pos);
 void dl_line(float x0, float y0, float x1, float y1, float w, rgb_t c, float a, bool round_cap);
 void dl_line_dashed(float x0, float y0, float x1, float y1, float w, rgb_t c, float a, bool round_cap, float on, float off);
 void dl_fill_circle(float cx, float cy, float rad, rgb_t c, float a);

@@ -14,6 +14,7 @@
 #include <time.h>
 #include "dlist.h"
 #include "esp_memory_utils.h"
+#include "esp_attr.h"
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -273,26 +274,78 @@ static void frame_unit(const orbpt_t *p, double u[3])
     }
 }
 
+// cos, sin of this frame's sidereal angle, set before the frame is recorded (float paths).
+static float frame_gc = 1, frame_gs = 0;
+
+// project3d() in floats, for the globe and flat views (the pilot view needs doubles).
+static proj_t project3f(const view_t *v, const float u[3], float rk)
+{
+    proj_t p = {0};
+    if (v->kind == GLOBE_FLAT) {
+        flat_xy(v->rot[0], u[0], u[1], u[2], &p.x, &p.y);
+        p.v[0] = p.x - CX; p.v[1] = CY - p.y;
+        p.front = p.in_view = true;
+        return p;
+    }
+    float e[3], k = R * rk * (float)(1 / EARTH_R_KM);
+    mul3(&v->M, u[0], u[1], u[2], e);
+    p.x = CX + k * e[0];
+    p.y = CY - k * e[1];
+    p.hidden = e[2] < 0 && k * k * (e[0] * e[0] + e[1] * e[1]) < R * R;
+    p.front = e[2] >= 0;
+    p.in_view = true;
+    p.v[0] = k * e[0]; p.v[1] = k * e[1]; p.v[2] = k * e[2];
+    return p;
+}
+
 static proj_t project_orbpt(const view_t *v, const orbpt_t *p)
 {
-    double u[3];
-    frame_unit(p, u);
-    return project3d(v, u, p->rk);
+    if (v->kind == GLOBE_PILOT) {
+        double u[3];
+        frame_unit(p, u);
+        return project3d(v, u, p->rk);
+    }
+    float u[3];
+    if (inertial_frame()) {
+        u[0] = p->eci[0] * frame_gc + p->eci[1] * frame_gs;
+        u[1] = -p->eci[0] * frame_gs + p->eci[1] * frame_gc;
+        u[2] = p->eci[2];
+    } else {
+        u[0] = p->ecef[0]; u[1] = p->ecef[1]; u[2] = p->ecef[2];
+    }
+    return project3f(v, u, (float)p->rk);
 }
 
 // ---------- strokes printed on the surface ----------
-typedef struct { float w; rgb_t c; float a; const gfx_dash_t *dash; } stroke_t;
+// bake: draw straight into this context (background cache) instead of the display list;
+// hair: a dl_hair_set + 1 to record into (line sets), 0: dl_thin.
+typedef struct { float w; rgb_t c; float a; const gfx_dash_t *dash; gfx_ctx_t *bake; int hair; } stroke_t;
+
+static inline float q16(float v) { return ((int)(v * 16 + 32768.5f) - 32768) * (1 / 16.0f); }
 
 // A segment printed on the globe: coloured like the lit surface at its middle.
 static void surface_segment(const view_t *v, float x0, float y0, float x1, float y1, const stroke_t *sk, gfx_dash_t *dash)
 {
-    float len = hypotf(x1 - x0, y1 - y0);
     int mx = (int)((x0 + x1) * 0.5f), my = (int)((y0 + y1) * 0.5f);
     float k = 0;
     rgb_t c = sk->c;
     if ((unsigned)mx < S && (unsigned)my < S) { k = 1; c = globe_shaded_stroke(mx, my, sk->c, v->kind == GLOBE_FLAT, &k); }
-    if (k > 0) dl_thin(x0, y0, x1, y1, sk->w, c, sk->a, dash);
-    if (dash) dash->pos += len;
+    if (k > 0) {
+        if (sk->bake) {
+            // As the display list stores it: 1/16 px, the dash phase within its period.
+            float on = dash ? dash->on : 0, off = dash ? dash->off : 0, ph = 0;
+            if (dash) {
+                float pos = fmaxf(dash->pos, 0), period = on + off;
+                ph = (int)((pos - period * (int)(pos / period)) * 16) * (1 / 16.0f);
+            }
+            gfx_thin_seg_on(sk->bake, q16(x0), q16(y0), q16(x1), q16(y1), sk->w, c, (int)(sk->a * 256.0f + 0.5f), on, off, ph);
+        } else if (sk->hair) {
+            dl_hair(sk->hair - 1, x0, y0, x1, y1, c, dash ? dash->pos : 0);
+        } else {
+            dl_thin(x0, y0, x1, y1, sk->w, c, sk->a, dash);
+        }
+    }
+    if (dash) dash->pos += sqrtf((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
 }
 
 // Vertices closer than this (squared, px) to the last drawn one are merged.
@@ -300,7 +353,10 @@ static void surface_segment(const view_t *v, float x0, float y0, float x1, float
 
 // Stroke a path of Earth-fixed unit vectors on the surface, cutting at the horizon like
 // clipAngle(90).
-static void draw_path(const view_t *v, const float *pts, int n, bool closed, const stroke_t *sk)
+// fxy: the points' flat-map positions at rot0 = 0 relative to the centre (flat_xy without the
+// turn), or NULL; cs: cos, sin of the turn.
+static void draw_path(const view_t *v, const float *pts, const float *fxy, const float cs[2], int n, bool closed,
+                      const stroke_t *sk)
 {
     gfx_dash_t dash = sk->dash ? *sk->dash : (gfx_dash_t){0};
     gfx_dash_t *dp = sk->dash ? &dash : NULL;
@@ -309,11 +365,11 @@ static void draw_path(const view_t *v, const float *pts, int n, bool closed, con
     int count = closed ? n + 1 : n;
     float a[3], b[3];
     if (v->kind == GLOBE_FLAT) {
-        flat_xy(v->rot[0], pts[0], pts[1], pts[2], &px, &py);
+        px = CX + fxy[1] * cs[0] + fxy[0] * cs[1];
+        py = CY + fxy[0] * cs[0] - fxy[1] * cs[1];
         for (int j = 1; j < count; j++) {
-            const float *q = pts + 3 * (j % n);
-            float x, y;
-            flat_xy(v->rot[0], q[0], q[1], q[2], &x, &y);
+            const float *q = fxy + 2 * (j % n);
+            float x = CX + q[1] * cs[0] + q[0] * cs[1], y = CY + q[0] * cs[0] - q[1] * cs[1];
             float dx = x - px, dy = y - py;
             if (j == count - 1 || dx * dx + dy * dy >= MERGE_PX2) {
                 surface_segment(v, px, py, x, y, sk, dp);
@@ -358,7 +414,7 @@ static void draw_path(const view_t *v, const float *pts, int n, bool closed, con
 }
 
 // Line sets from generated/*.bin (int16 unit vectors), converted to floats at start-up.
-typedef struct { uint32_t nlines; uint16_t *lens; float *pts; } lineset_t;
+typedef struct { uint32_t nlines; uint16_t *lens; float *pts, *flat; } lineset_t;
 static lineset_t borders, graticule;
 extern const uint8_t borders_bin_start[] asm("_binary_borders_bin_start");
 extern const uint8_t graticule_bin_start[] asm("_binary_graticule_bin_start");
@@ -377,15 +433,26 @@ static lineset_t load_lines(const uint8_t *bin)
         memcpy(&q, p + 2 * i, 2);
         ls.pts[i] = q / 32767.0f;
     }
+    // Flat-map positions before the turn: the map only turns about its centre.
+    ls.flat = heap_caps_malloc(hdr[1] * 2 * sizeof(float), MALLOC_CAP_SPIRAM);
+    for (uint32_t i = 0; i < hdr[1]; i++) {
+        float x, y;
+        flat_xy(0, ls.pts[3 * i], ls.pts[3 * i + 1], ls.pts[3 * i + 2], &x, &y);
+        // flat_xy(0): x = CX + k·uy, y = CY + k·ux
+        ls.flat[2 * i] = y - CY;
+        ls.flat[2 * i + 1] = x - CX;
+    }
     return ls;
 }
 
 static void draw_lineset(const view_t *v, const lineset_t *ls, const stroke_t *s)
 {
-    const float *p = ls->pts;
+    const float *p = ls->pts, *f = ls->flat;
+    const float cs[2] = {cosf(v->rot[0] / (float)DEG), sinf(v->rot[0] / (float)DEG)};
     for (uint32_t i = 0; i < ls->nlines; i++) {
-        draw_path(v, p, ls->lens[i], false, s);
+        draw_path(v, p, f, cs, ls->lens[i], false, s);
         p += 3 * ls->lens[i];
+        f += 2 * ls->lens[i];
     }
 }
 
@@ -487,7 +554,7 @@ static void draw_rose(const view_t *v)
     for (int i = 0; i < 3; i++) {
         const float cd = cosf(ring[i]), sd = sinf(ring[i]);
         for (int a = 0; a <= 180; a++) destination_cs(&g, az_cs[a][0], az_cs[a][1], cd, sd, pts + 3 * a);
-        stroke_t sk = {i == 0 ? fmaxf(1.2f, S / 320.0f) : fmaxf(0.8f, S / 600.0f), AMBER, 1, NULL};
+        stroke_t sk = {i == 0 ? fmaxf(1.2f, S / 320.0f) : fmaxf(0.8f, S / 600.0f), AMBER, 1, NULL, NULL, 0};
         ground_polyline(v, pts, 181, labels, nl, &sk);
     }
     for (int j = 0; j < nl; j++) {
@@ -496,7 +563,7 @@ static void draw_rose(const view_t *v)
         dl_text(&FONT_600_13, txt[labels[j].e], labels[j].x, labels[j].y, GFX_CENTER, col, 1, 0);
     }
     // Thin cross through the sub-satellite point, broken where the labels sit.
-    stroke_t thin = {fmaxf(0.8f, S / 600.0f), AMBER, 1, NULL};
+    stroke_t thin = {fmaxf(0.8f, S / 600.0f), AMBER, 1, NULL, NULL, 0};
     const float cstep = cosf(ring[0] / 60), sstep = sinf(ring[0] / 60);
     for (int az = 0; az < 4; az++) {
         float arm[3 * 61], cd = 1, sd = 0;   // distance along the arm by rotation steps
@@ -510,7 +577,7 @@ static void draw_rose(const view_t *v)
     }
     // Ticks outside the horizon ring every 10°, long every 30°, and N / E / S / W beyond them.
     const float px_rad = (flat ? (float)M_PI : 1.0f) / R;
-    stroke_t tk = {fmaxf(1, S / 480.0f), AMBER, 1, NULL};
+    stroke_t tk = {fmaxf(1, S / 480.0f), AMBER, 1, NULL, NULL, 0};
     static const char *ROSE[4] = {"N", "E", "S", "W"};
     for (int az = 0; az < 360; az += 10) {
         bool major = az % 30 == 0;
@@ -561,7 +628,7 @@ static void tick(const view_t *v, const proj_t *p, const proj_t *q, bool major, 
     float half = major ? S / 95.0f : S / 170.0f, nx = -dy / n * half, ny = dx / n * half;
     float w = fmaxf(1, S / 480.0f) * (major ? 1.25f : 1);
     if (printed) {
-        stroke_t sk = {w, col, alpha, NULL};
+        stroke_t sk = {w, col, alpha, NULL, NULL, 0};
         surface_segment(v, p->x - nx, p->y - ny, p->x + nx, p->y + ny, &sk, NULL);
     } else {
         dl_thin(p->x - nx, p->y - ny, p->x + nx, p->y + ny, w, col, alpha, NULL);
@@ -576,7 +643,7 @@ static void draw_behind(const view_t *v, const snapshot_t *s)
     for (int i = 1; i < track_n; i++) {
         const proj_t *a = &track_pts[i - 1], *b = &track_pts[i];
         if (!(a->hidden || b->hidden)) continue;
-        stroke_t sk = {S / 260.0f, BEHIND, BEHIND_ALPHA * track_alpha((track_t[i - 1] + track_t[i]) / 2), NULL};
+        stroke_t sk = {S / 260.0f, BEHIND, BEHIND_ALPHA * track_alpha((track_t[i - 1] + track_t[i]) / 2), NULL, NULL, 0};
         surface_segment(v, a->x, a->y, b->x, b->y, &sk, NULL);
     }
     double shift = st.t - s->t;
@@ -592,7 +659,7 @@ static void draw_behind(const view_t *v, const snapshot_t *s)
         double rk = model_geo(st.now.r, st.now.gmst, u);
         proj_t a = project3d(v, u, rk);
         if (a.hidden && a.in_view) {   // hollow ring for a hidden object
-            stroke_t sk = {S / 260.0f, BEHIND, 1, NULL};
+            stroke_t sk = {S / 260.0f, BEHIND, 1, NULL, NULL, 0};
             float r = S / 55.0f, px = a.x + r, py = a.y;
             for (int k = 1; k <= 48; k++) {
                 float t = k * 2 * (float)M_PI / 48, x = a.x + r * cosf(t), y = a.y + r * sinf(t);
@@ -1580,16 +1647,22 @@ typedef struct {
 } frame_job_t;
 
 // A finished strip (rows y0 .. y0 + n) into the frame buffer, turned 180° if the board is
-// mounted that way. Each row is reversed in place in the (internal RAM) strip and then copied
-// forward to its mirrored row: writing PSRAM backwards pixel by pixel is several times slower.
-static void strip_out(uint16_t *fb, uint16_t *sb, int y0, int n)
+// mounted that way: each row is read backwards from the (internal RAM) strip, its pixel pairs
+// swapped, and written forward to its mirrored row (writing PSRAM backwards pixel by pixel is
+// several times slower).
+static inline uint32_t swap16(uint32_t v) { return v >> 16 | v << 16; }
+
+// (in internal RAM like the other per-pixel code: scene.c runs from flash)
+static IRAM_ATTR void strip_out(uint16_t *fb, uint16_t *sb, int y0, int n)
 {
 #if GFX_ROT180
     for (int r = 0; r < n; r++) {
-        uint32_t *a = (uint32_t *)(sb + r * S), *b = a + S / 2 - 1;
-        for (; a < b; a++, b--) { uint32_t va = *a, vb = *b; *a = vb >> 16 | vb << 16; *b = va >> 16 | va << 16; }
-        if (a == b) *a = *a >> 16 | *a << 16;
-        memcpy(fb + (S - 1 - y0 - r) * S, sb + r * S, S * 2);
+        const uint32_t *src = (const uint32_t *)(sb + r * S) + S / 2;
+        uint32_t *dst = (uint32_t *)(fb + (S - 1 - y0 - r) * S), *end = dst + S / 2;
+        for (; dst < end; dst += 4, src -= 4) {
+            uint32_t a = src[-1], b = src[-2], c = src[-3], d = src[-4];
+            dst[0] = swap16(a); dst[1] = swap16(b); dst[2] = swap16(c); dst[3] = swap16(d);
+        }
     }
 #else
     memcpy(fb + y0 * S, sb, n * S * 2);
@@ -1599,19 +1672,41 @@ static void strip_out(uint16_t *fb, uint16_t *sb, int y0, int n)
 // One strip buffer in internal RAM per core.
 static uint16_t *strip_buf[2];
 
-// Record the frame (part 0: borders and graticule; part 1: everything above them).
+// Borders and graticule, into the display list or (bake) straight into a frame.
+static void surface_lines(const view_t *v, gfx_ctx_t *bake)
+{
+    static const gfx_dash_t border_dash = {3, 2, 0};
+    const stroke_t bs = {0.7f, RGB(20, 20, 20), .5f, &border_dash, bake, bake ? 0 : dl_hair_set(0.7f, .5f, 3, 2) + 1};
+    draw_lineset(v, &borders, &bs);
+    const stroke_t gs = {0.6f, WHITE, .16f, NULL, bake, bake ? 0 : dl_hair_set(0.6f, .16f, 0, 0) + 1};
+    draw_lineset(v, &graticule, &gs);
+}
+
+// The background task's full-resolution globe gets the lines printed on it, so still frames
+// that show it neither record nor draw them.
+static gfx_ctx_t *bake_ctx;
+
+static void bake_lines(uint16_t *fb, const globe_view_t *gv)
+{
+    view_t v = {0};
+    v.kind = gv->kind;
+    memcpy(v.rot, gv->rot, sizeof v.rot);
+    v.M = view_matrix(gv->rot);
+    gfx_ctx_target(bake_ctx, fb);
+    surface_lines(&v, bake_ctx);
+}
+
+// Record the frame (part 0: borders and graticule, or the rose when the lines are baked into
+// the cached globe; part 1: everything above them).
 static void record(int part, const void *vctx)
 {
     const frame_job_t *j = vctx;
     const view_t *v = &j->v;
     if (part == 0) {
-        if (v->kind != GLOBE_PILOT) {
-            static const gfx_dash_t border_dash = {3, 2, 0};
-            const stroke_t bs = {0.7f, RGB(20, 20, 20), .5f, &border_dash};
-            draw_lineset(v, &borders, &bs);
-            const stroke_t gs = {0.6f, WHITE, .16f, NULL};
-            draw_lineset(v, &graticule, &gs);
-        }
+        // (a cached full-resolution globe has them printed on it already); the rose above them,
+        // here when the lines are not drawn (it balances the two cores' share of the recording)
+        if (v->kind != GLOBE_PILOT && !j->base) surface_lines(v, NULL);
+        if (v->kind != GLOBE_PILOT && j->base) draw_rose(v);
         return;
     }
     const snapshot_t *s = j->snap;
@@ -1623,7 +1718,7 @@ static void record(int part, const void *vctx)
         }
     } else {
         project_track(v, s);
-        draw_rose(v);
+        if (!j->base) draw_rose(v);
         if (s) draw_behind(v, s);
         if (v->kind != GLOBE_FLAT) draw_reticle();
         draw_home(v);
@@ -1730,6 +1825,7 @@ void scene_render(uint16_t *fb, scene_timing_t *tm)
     job.v.M = view_matrix(gv->rot);
     job.v.cam = cam;
 
+    if (st.now.ok) { frame_gc = (float)cos(st.now.gmst); frame_gs = (float)sin(st.now.gmst); }
     dl_begin();
     globe_both_cores(record, &job);
     dl_finish();
@@ -1774,6 +1870,8 @@ void scene_init(void)
     borders = load_lines(borders_bin_start);
     graticule = load_lines(graticule_bin_start);
     rose_init();
+    bake_ctx = gfx_ctx_new(NULL, 0, S);
+    if (bake_ctx) globe_cache_bake(bake_lines);
     find_widest(&RF_TIME);
     find_widest(&RF_PRIMARY);
     find_widest(&RF_SECONDARY);

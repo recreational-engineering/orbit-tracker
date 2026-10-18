@@ -1,9 +1,20 @@
 # The per-pixel and replay code runs from internal RAM: from flash, its code competes in the
 # L2 cache with the texture and frame-buffer traffic and keeps being refetched over SPI.
+# Their start-up functions stay in flash (the default): the main SRAM is needed for the render
+# strips and Wi-Fi.
 [mapping:orbit_render]
 archive: libmain.a
 entries:
     gfx (noflash)
+    gfx:gfx_init (default)
+    gfx:gfx_ctx_new (default)
+    gfx:gfx_mask_build (default)
+    gfx:gfx_mask_free (default)
     globe (noflash)
+    globe:globe_init (default)
+    globe:sphere_light (default)
+    globe:flat_light (default)
+    globe:pack_light (default)
     dlist (noflash)
+    dlist:dl_init (default)
     tiles (noflash)

@@ -51,7 +51,9 @@ static uint8_t *cover;
 static uint16_t *shade_grid[2];   // in PSRAM: 32 KB, read only for strokes on the globe
 // Earth spin: u (turn, 16 bit) | sqrt(1 - t²)·255 << 16 for t = Xs / cos(lat) in [-1, 1].
 #define SPIN_N 4096
-static uint32_t spin_lut[SPIN_N];
+// One guard entry at each end (rounding at the row ends): spin_lut[-1 .. SPIN_N].
+static uint32_t spin_lut_g[SPIN_N + 2];
+#define spin_lut (spin_lut_g + 1)
 // Per disc pixel tables for the polar-axis paths: [0] equatorial globe: u0 | Z·255 << 16,
 // [1] flat map: u0 | texture row << 16 (u0: longitude at λ = 0 as a fraction of a turn);
 // flat_nrm: the flat map's surface normal at λ = 0 as int8 A | B << 8 | ez << 16.
@@ -219,6 +221,8 @@ static void build_static_layers(void)
         uint32_t u = (uint32_t)(int)floorf((asinf(t) / (2 * (float)M_PI) + 0.5f) * 65536) & 0xFFFF;
         spin_lut[i] = u | (uint32_t)(sqrtf(fmaxf(0, 1 - t * t)) * 255 + 0.5f) << 16;
     }
+    spin_lut[-1] = spin_lut[0];
+    spin_lut[SPIN_N] = spin_lut[SPIN_N - 1];
     for (int k = 0; k < 2; k++) {
         light_tab[k] = heap_caps_malloc(n_px * 2, MALLOC_CAP_SPIRAM);
         axis_tab[k] = heap_caps_malloc(n_px * 4, MALLOC_CAP_SPIRAM);
@@ -331,6 +335,8 @@ static inline float fast_atan2f(float y, float x)
 static float *asin_lut, *polar_lut;
 // exp(-h / 90 km) for the pilot view's limb glow, over 0 .. 2000 km in 1 km steps.
 #define GLOW_N 2048
+// exp(-h / 90) · 255 < 1 beyond h = 90 ln 255 ≈ 499 km
+#define GLOW_FAINT 500
 static float *glow_lut;
 
 static void build_luts(void)
@@ -489,6 +495,9 @@ typedef struct {
     float P, Q;                              // polar-axis paths: sun dot coefficients
     // pilot
     float tanH, pix_ang, cc2, t_horizon, inv_t_horizon, hi_max_t, cgm, sgm;
+    float ccx, ccy, ccz;                     // camera position as floats (double converts in software)
+    int32_t qt[3], ql[3], hi_max_tq, grat_w; // pilot_shade's fixed-point thresholds and scales
+    uint32_t haze_k;
 } rctx_t;
 
 static void rctx_init(rctx_t *c, const globe_view_t *v, uint16_t *fb, int level)
@@ -515,10 +524,22 @@ static void rctx_init(rctx_t *c, const globe_view_t *v, uint16_t *fb, int level)
         c->tanH = tanf((float)(PILOT_HALF_FOV_DEG * M_PI / 180));
         c->pix_ang = 2 * c->tanH / S;
         c->cc2 = (float)(cam->c[0] * cam->c[0] + cam->c[1] * cam->c[1] + cam->c[2] * cam->c[2]);
+        c->ccx = (float)cam->c[0]; c->ccy = (float)cam->c[1]; c->ccz = (float)cam->c[2];
         c->t_horizon = sqrtf(fmaxf(0, c->cc2 - EARTH_R_KM * EARTH_R_KM));
         c->inv_t_horizon = 1.0f / fmaxf(1, c->t_horizon);
         c->hi_max_t = 12.0f / c->pix_ang;   // tiles where the ground footprint is under 12 km
         c->cgm = cosf((float)cam->gmst); c->sgm = sinf((float)cam->gmst);
+        // pilot_shade: t · fp (km² Q8) against the squared footprints of the texture levels
+        // (q = t · pixel angle · fp < size²), t Q4, the graticule's 1.5 px in degrees Q16 per
+        // unit of t Q4 (Q12), and the haze's t / t_horizon (Q15 per unit of t Q4, Q16).
+        const float T2 = HI_TEXEL_KM * HI_TEXEL_KM, L2 = LIGHT_TEXEL_KM * LIGHT_TEXEL_KM;
+        for (int k = 0; k < 3; k++) {
+            c->qt[k] = (int32_t)(T2 * (1 << (2 * k)) / c->pix_ang * 256);
+            c->ql[k] = (int32_t)(L2 * (1 << (2 * k)) / c->pix_ang * 256);
+        }
+        c->hi_max_tq = (int32_t)(c->hi_max_t * 16);
+        c->grat_w = (int32_t)(1.5f * c->pix_ang * 57.29578f / EARTH_R_KM * 65536 / 16 * 4096);
+        c->haze_k = (uint32_t)(134217728.0f * c->inv_t_horizon);   // 2^27 / t_horizon
     }
 }
 
@@ -612,7 +633,8 @@ typedef struct { uint32_t u; int32_t v, sun, z; } gq_t;
 static inline void to_fixed(const gp_t *p, gq_t *q)
 {
     q->u = (uint32_t)(int32_t)((p->fu - 0.5f) * 4294967296.0f) + 0x80000000u;   // no 64-bit convert
-    q->v = (int32_t)(p->fv * 256);
+    // (inside the texture with a margin: interpolated steps may fall a few 1/256 short of an end)
+    q->v = (int32_t)(fminf(fmaxf(p->fv, 0.05f), TEX_H - 0.05f) * 256);
     q->sun = (int32_t)(p->sun * 4096);
     q->z = (int32_t)(p->z * 255 * 256);
 }
@@ -634,7 +656,7 @@ static inline __attribute__((always_inline)) uint16_t sample_px(const rctx_t *c,
 
 // One row of samples at screen x = x0 + k·step (k < n), exact every SPAN samples and linear in
 // between, written through put(k, pixel).
-#define SAMPLE_ROW(X_OF, PUT) do { \
+#define SAMPLE_ROW(X_OF, PUT, SPANPUT) do { \
     gp_t a_, b_, p_; gq_t qa_, qb_, q_; \
     ortho_param(c, (X_OF(0) - CX) * inv_r, Ys, &a_); \
     to_fixed(&a_, &qa_); \
@@ -644,24 +666,52 @@ static inline __attribute__((always_inline)) uint16_t sample_px(const rctx_t *c,
         to_fixed(&b_, &qb_); \
         float du_; \
         if (span_linear(&a_, &b_, &du_)) { \
-            int32_t ddu_ = (int32_t)(du_ * 4294967296.0f / m_); \
-            int32_t dv_, ds_, dz_; \
-            if (m_ == SPAN) { dv_ = (qb_.v - qa_.v) >> 3; ds_ = (qb_.sun - qa_.sun) >> 3; dz_ = (qb_.z - qa_.z) >> 3; } \
-            else { dv_ = (qb_.v - qa_.v) / m_; ds_ = (qb_.sun - qa_.sun) / m_; dz_ = (qb_.z - qa_.z) / m_; } \
-            q_ = qa_; \
-            for (int k_ = 0; k_ < m_; k_++) { \
-                PUT(k0_ + k_, q_); \
-                q_.u += ddu_; q_.v += dv_; q_.sun += ds_; q_.z += dz_; \
+            if (m_ == SPAN) { \
+                q_ = qa_; \
+                SPANPUT(k0_, q_, (int32_t)(du_ * (4294967296.0f / SPAN)), (qb_.v - qa_.v) >> 3, \
+                        (qb_.sun - qa_.sun) >> 3, (qb_.z - qa_.z) >> 3); \
+            } else { \
+                LERP_RUN(PUT, k0_, m_, qa_, qb_, du_); \
             } \
+        } else if (m_ >= 4) { \
+            /* Not linear over the span (poles, limb): try its halves before exact samples. */ \
+            const int h_ = m_ >> 1; \
+            gp_t mid_; gq_t qm_; \
+            ortho_param(c, (X_OF(k0_ + h_) - CX) * inv_r, Ys, &mid_); \
+            to_fixed(&mid_, &qm_); \
+            float dh_; \
+            if (span_linear(&a_, &mid_, &dh_)) { LERP_RUN(PUT, k0_, h_, qa_, qm_, dh_); } \
+            else EXACT_RUN(X_OF, PUT, k0_, h_, qa_); \
+            if (span_linear(&mid_, &b_, &dh_)) { LERP_RUN(PUT, k0_ + h_, m_ - h_, qm_, qb_, dh_); } \
+            else EXACT_RUN(X_OF, PUT, k0_ + h_, m_ - h_, qm_); \
         } else { \
-            for (int k_ = 0; k_ < m_; k_++) { \
-                ortho_param(c, (X_OF(k0_ + k_) - CX) * inv_r, Ys, &p_); \
-                to_fixed(&p_, &q_); \
-                PUT(k0_ + k_, q_); \
-            } \
+            EXACT_RUN(X_OF, PUT, k0_, m_, qa_); \
         } \
         a_ = b_; qa_ = qb_; k0_ += m_; \
     } } while (0)
+
+// Samples k0 .. k0 + m - 1 interpolated from qa (at k0) to qb (at k0 + m); du: the turn between.
+#define LERP_RUN(PUT, k0, m, qa, qb, du) do { \
+    const float im_ = inv_n[m]; \
+    const int32_t ddu_ = (int32_t)((du) * 4294967296.0f * im_); \
+    const int32_t dv_ = (int32_t)(((qb).v - (qa).v) * im_), ds_ = (int32_t)(((qb).sun - (qa).sun) * im_), \
+                  dz_ = (int32_t)(((qb).z - (qa).z) * im_); \
+    gq_t r_ = (qa); \
+    for (int k_ = 0; k_ < (m); k_++) { \
+        PUT((k0) + k_, r_); \
+        r_.u += ddu_; r_.v += dv_; r_.sun += ds_; r_.z += dz_; \
+    } } while (0)
+
+// Samples k0 .. k0 + m - 1 exactly; qa: the sample at k0, known.
+#define EXACT_RUN(X_OF, PUT, k0, m, qa) do { \
+    PUT((k0), (qa)); \
+    for (int k_ = 1; k_ < (m); k_++) { \
+        ortho_param(c, (X_OF((k0) + k_) - CX) * inv_r, Ys, &p_); \
+        to_fixed(&p_, &q_); \
+        PUT((k0) + k_, q_); \
+    } } while (0)
+
+static const float inv_n[SPAN + 1] = {0, 1, 1 / 2.0f, 1 / 3.0f, 1 / 4.0f, 1 / 5.0f, 1 / 6.0f, 1 / 7.0f, 1 / 8.0f};
 
 static void ortho_row_full(const rctx_t *c, int y)
 {
@@ -678,7 +728,9 @@ static void ortho_row_full(const rctx_t *c, int y)
     uint16_t *out = row + x0;
 #define XF(k) (x0 + (k) + 0.5f)
 #define PUTF(k, q) out[k] = sample_px(c, &(q), lt[k], drow[(x0 + (k)) & 3])
-    SAMPLE_ROW(XF, PUTF);
+#define SPANF(k0, q, du, dv, ds, dz) for (int k_ = 0; k_ < SPAN; k_++) { PUTF(k0 + k_, q); q.u += du; q.v += dv; q.sun += ds; q.z += dz; }
+    SAMPLE_ROW(XF, PUTF, SPANF);
+#undef SPANF
 #undef XF
 #undef PUTF
 }
@@ -701,7 +753,29 @@ static void ortho_rows_half(const rctx_t *c, int by)
     uint32_t *o0 = (uint32_t *)(row0 + 2 * bx0), *o1 = (uint32_t *)(row1 + 2 * bx0);   // 2 px each, aligned
 #define XH(k) (2 * (bx0 + (k)) + 1.0f)
 #define PUTH(k, q) do { uint32_t px_ = sample_px(c, &(q), lt[k], drow[(bx0 + (k)) & 3]); px_ |= px_ << 16; o0[k] = px_; o1[k] = px_; } while (0)
-    SAMPLE_ROW(XH, PUTH);
+    // A whole linear span at texture level 1 (half resolution). The row needs no clamp here:
+    // to_fixed keeps the span's ends inside the texture and the steps stay between them.
+    const uint32_t hd[4] = {drow[bx0 & 3], drow[(bx0 + 1) & 3], drow[(bx0 + 2) & 3], drow[(bx0 + 3) & 3]};
+#define SPANH(k0, q, du, dv, ds, dz) do { \
+        const uint16_t *l_ = lt + (k0); \
+        uint32_t *p0_ = o0 + (k0), *p1_ = o1 + (k0); \
+        gq_t r_ = (q); \
+        for (int k_ = 0; k_ < SPAN; k_++) { \
+            const uint32_t d_ = hd[k_ & 3]; \
+            const uint32_t u_ = r_.u >> 22, v_ = (uint32_t)r_.v >> 9; \
+            uint32_t x_ = SPREAD(tex1[((v_ >> 3) * (TEX_W / 16) + (u_ >> 3)) << 6 | (v_ & 7) << 3 | (u_ & 7)]); \
+            if (__builtin_expect(r_.sun < NIGHT_HI, 0)) { \
+                int lv_ = lod_z[r_.z >> 8], vv_ = r_.v >> 8; \
+                x_ = sw_night(x_, r_.sun, lights[lv_][(vv_ >> lv_) * (TEX_W >> lv_) + (r_.u >> (21 + lv_))], d_); \
+            } \
+            uint32_t px_ = UNSPREAD(sw_light(x_, l_[k_], d_)); \
+            px_ |= px_ << 16; p0_[k_] = px_; p1_[k_] = px_; \
+            r_.u += (du); r_.v += (dv); r_.sun += (ds); r_.z += (dz); \
+        } \
+    } while (0)
+    const uint16_t *tex1 = texture[1];
+    SAMPLE_ROW(XH, PUTH, SPANH);
+#undef SPANH
 #undef XH
 #undef PUTH
     int ib = bx0, ie = bx1;
@@ -782,7 +856,42 @@ static inline __attribute__((always_inline)) void spin_inner(const rctx_t *c, in
     const uint32_t *drow = DQ[y & 3];
     const uint32_t uoff = c->uoff;
     const int xe = in_x1[y];
-    for (int x = in_x0[y]; x < xe; x += step, xq += dxq, tq += dtq) {
+    int x = in_x0[y];
+    const int ns = (xe - x + step - 1) / step;   // samples in the row
+    if (ns >= 8 && tq >> 16 >= -1 && (tq + dtq * (ns - 1)) >> 16 <= SPIN_N) {
+        // The table index in range across the row (no clamp): four samples per iteration with
+        // their dither thresholds in registers. The sun's elevation as
+        // zt·Kz + sacc (Q12 after >> 8) with zt = Z·255 / cos(lat) from the table.
+        const int Kz = (crq * Pz) >> 8;
+        int32_t sacc = xq + (rowq << 8);
+        const int32_t dsq = dxq;
+        const uint32_t d0 = drow[x & 3], d1 = drow[(x + step) & 3], d2 = drow[(x + 2 * step) & 3], d3 = drow[(x + 3 * step) & 3];
+#define SPIN_PX(XX, D) do { \
+            uint32_t t_ = spin_lut[tq >> 16], zt_ = t_ >> 16, uf_ = (t_ + uoff) & 0xFFFF, u_ = uf_ >> 5; \
+            uint32_t px_ = SPREAD(trow[(u_ & ~7u) << 3 | (u_ & 7)]); \
+            int sun_ = (((int)zt_ * Kz) >> 8) + (sacc >> 8); \
+            if (__builtin_expect(sun_ < NIGHT_HI, 0)) { \
+                int lv_ = lod_z[(zt_ * crq) >> 8]; \
+                px_ = sw_night(px_, sun_, lrow[lv_][uf_ >> (5 + lv_)], D); \
+            } \
+            uint32_t l_ = lt[XX]; \
+            px_ = ((px_ * ((l_ & 31) + 1) + (D)) >> 5) & SW_MASK; \
+            if (l_ >> 5) { uint32_t s5_ = (l_ >> 5) & 31, s6_ = l_ >> 10; px_ = sw_sat_add(px_, s5_ | s5_ << 11 | s6_ << 21); } \
+            row[XX] = UNSPREAD(px_); \
+            if (step == 2 && (XX) + 1 < xe) row[(XX) + 1] = row[XX]; \
+            tq += dtq; sacc += dsq; \
+        } while (0)
+        for (; x + 4 * step <= xe; x += 4 * step) {
+            SPIN_PX(x, d0);
+            SPIN_PX(x + step, d1);
+            SPIN_PX(x + 2 * step, d2);
+            SPIN_PX(x + 3 * step, d3);
+        }
+        for (; x < xe; x += step) SPIN_PX(x, drow[x & 3]);
+#undef SPIN_PX
+        return;
+    }
+    for (; x < xe; x += step, xq += dxq, tq += dtq) {
         int ti = tq >> 16;
         ti = ti < 0 ? 0 : ti > SPIN_N - 1 ? SPIN_N - 1 : ti;
         uint32_t t = spin_lut[ti], uf = (t + uoff) & 0xFFFF;
@@ -881,7 +990,7 @@ static void pilot_ray(const rctx_t *c, float Xs, float Ys, pp_t *o)
     float dz = cam->f[2] + (Xs * cam->rt[2] + Ys * cam->u[2]) * c->tanH;
     float inv = rsqrt_fast(dx * dx + dy * dy + dz * dz);
     dx *= inv; dy *= inv; dz *= inv;
-    float cx = (float)cam->c[0], cy = (float)cam->c[1], cz = (float)cam->c[2];
+    const float cx = c->ccx, cy = c->ccy, cz = c->ccz;
     float b = cx * dx + cy * dy + cz * dz;
     float disc = b * b - (c->cc2 - RE * RE);
     float t = disc >= 0 ? -b - disc * rsqrt_fast(fmaxf(disc, 1e-6f)) : -1;
@@ -891,10 +1000,12 @@ static void pilot_ray(const rctx_t *c, float Xs, float Ys, pp_t *o)
         float qx = cx + tc * dx, qy = cy + tc * dy, qz = cz + tc * dz;
         float qq = qx * qx + qy * qy + qz * qz, qinv = rsqrt_fast(qq), qn = qq * qinv;
         int gi = (int)fmaxf(0, qn - RE);
-        float glow = gi < GLOW_N ? glow_lut[gi] : 0;
+        o->ground = false;
+        // Beyond GLOW_FAINT km the glow adds less than one step to any channel: plain space.
+        if (gi >= GLOW_FAINT) { o->px = gfx_pack(PILOT_BG.r, PILOT_BG.g, PILOT_BG.b); return; }
+        float glow = glow_lut[gi];
         float sd = ((qx * c->cgm + qy * c->sgm) * c->sx + (-qx * c->sgm + qy * c->cgm) * c->sy + qz * c->sz) * qinv;
         float lit = smoothstep(-0.2f, 0.15f, sd);
-        o->ground = false;
         o->px = gfx_pack((int)(4 + 90 * glow * lit), (int)(6 + 150 * glow * lit),
                          (int)fminf(255, 14 + 255 * glow * (0.15f + 0.85f * lit)));
         return;
@@ -920,15 +1031,33 @@ static void pilot_ray(const rctx_t *c, float Xs, float Ys, pp_t *o)
 // the level is chosen by the block's ground footprint and sampled bilinearly.
 #define SW_RND (16u | 16u << 11 | 16u << 21)   // +0.5 in each spread field before >> 5
 
-// Bilinear in an n x n RGB565 image at (x, y) in its texels (centres at +0.5), clamped at the
-// edges; returns a spread pixel.
-static inline uint32_t bil565(const uint16_t *img, int n, float x, float y)
+// A ground sample in fixed point (integer steps are cheap on this core, float ones have a long
+// latency): texture column as a fraction of a turn (wraps by itself), row in level-0 texels Q16
+// (inside the texture), sun elevation Q12, distance t (km Q4), footprint fp (km Q8), cos(lat) Q12.
+typedef struct { uint32_t u; int32_t v, sun, t, fp, cl; } pq_t;
+
+static inline void pilot_fixed(const pp_t *p, pq_t *q)
 {
-    x -= 0.5f; y -= 0.5f;
-    x = x < 0 ? 0 : x > n - 1 ? n - 1 : x;
-    y = y < 0 ? 0 : y > n - 1 ? n - 1 : y;
-    int x0 = (int)x, y0 = (int)y, x1 = x0 + (x0 < n - 1), y1 = y0 + (y0 < n - 1);
-    uint32_t wx = (uint32_t)((x - x0) * 32), wy = (uint32_t)((y - y0) * 32);
+    q->u = (uint32_t)(int32_t)((p->fu - 0.5f) * 4294967296.0f) + 0x80000000u;   // no 64-bit convert
+    q->v = (int32_t)(fminf(fmaxf(p->fv, 0), TEX_H * 0.9999f) * 65536);
+    q->sun = (int32_t)(p->sun * 4096);
+    q->t = (int32_t)(p->t * 16);
+    q->fp = (int32_t)(p->fp * 256);
+    q->cl = (int32_t)(p->cl * 4096);
+}
+
+static inline uint32_t mulhu(uint32_t a, uint32_t b) { return (uint32_t)(((uint64_t)a * b) >> 32); }
+
+// Bilinear in an n x n RGB565 image at (x, y) in its texels Q16 (centres at +0.5), clamped at
+// the edges; returns a spread pixel.
+static inline uint32_t bil565(const uint16_t *img, int n, int32_t x, int32_t y)
+{
+    const int32_t mx = (n - 1) << 16;
+    x -= 0x8000; y -= 0x8000;
+    x = x < 0 ? 0 : x > mx ? mx : x;
+    y = y < 0 ? 0 : y > mx ? mx : y;
+    int x0 = x >> 16, y0 = y >> 16, x1 = x0 + (x0 < n - 1), y1 = y0 + (y0 < n - 1);
+    uint32_t wx = (x >> 11) & 31, wy = (y >> 11) & 31;
     const uint16_t *r0 = img + y0 * n, *r1 = img + y1 * n;
     uint32_t top = ((SPREAD(r0[x0]) * (32 - wx) + SPREAD(r0[x1]) * wx + SW_RND) >> 5) & SW_MASK;
     uint32_t bot = ((SPREAD(r1[x0]) * (32 - wx) + SPREAD(r1[x1]) * wx + SW_RND) >> 5) & SW_MASK;
@@ -936,25 +1065,26 @@ static inline uint32_t bil565(const uint16_t *img, int n, float x, float y)
 }
 
 // The same for an n x n grey image.
-static inline int bil8(const uint8_t *img, int n, float x, float y)
+static inline int bil8(const uint8_t *img, int n, int32_t x, int32_t y)
 {
-    x -= 0.5f; y -= 0.5f;
-    x = x < 0 ? 0 : x > n - 1 ? n - 1 : x;
-    y = y < 0 ? 0 : y > n - 1 ? n - 1 : y;
-    int x0 = (int)x, y0 = (int)y, x1 = x0 + (x0 < n - 1), y1 = y0 + (y0 < n - 1);
-    int wx = (int)((x - x0) * 256), wy = (int)((y - y0) * 256);
+    const int32_t mx = (n - 1) << 16;
+    x -= 0x8000; y -= 0x8000;
+    x = x < 0 ? 0 : x > mx ? mx : x;
+    y = y < 0 ? 0 : y > mx ? mx : y;
+    int x0 = x >> 16, y0 = y >> 16, x1 = x0 + (x0 < n - 1), y1 = y0 + (y0 < n - 1);
+    int wx = (x >> 8) & 255, wy = (y >> 8) & 255;
     const uint8_t *r0 = img + y0 * n, *r1 = img + y1 * n;
     int top = r0[x0] * (256 - wx) + r0[x1] * wx, bot = r1[x0] * (256 - wx) + r1[x1] * wx;
     return (top * (256 - wy) + bot * wy + 32768) >> 16;
 }
 
 // Global texture level lev (0: 2048 x 1024, 1: half), bilinear, wrapping east-west.
-static inline uint32_t bil_global(int lev, float fu, float fvn)
+static inline uint32_t bil_global(int lev, uint32_t u, int32_t v)
 {
     const int w = TEX_W >> lev, h = TEX_H >> lev, tx = (TEX_W / 8) >> lev;
-    float gu = fu * w - 0.5f, gv = fvn * h - 0.5f;
-    int u0 = (int)floorf(gu), v0 = (int)floorf(gv);
-    uint32_t wu = (uint32_t)((gu - u0) * 32), wv = (uint32_t)((gv - v0) * 32);
+    const int32_t gu = (int32_t)mulhu(u, (uint32_t)w << 16) - 0x8000, gv = (v >> lev) - 0x8000;
+    int u0 = gu >> 16, v0 = gv >> 16;
+    uint32_t wu = (gu >> 11) & 31, wv = (gv >> 11) & 31;
     if (u0 < 0) u0 += w;
     int u1 = u0 + 1 < w ? u0 + 1 : 0, v1 = v0 + 1 < h ? v0 + 1 : h - 1;
     if (v0 < 0) v0 = 0;
@@ -965,12 +1095,12 @@ static inline uint32_t bil_global(int lev, float fu, float fvn)
 }
 
 // City-light level lev of the global mip chain, bilinear.
-static inline int bil_global_lights(int lev, float fu, float fvn)
+static inline int bil_global_lights(int lev, uint32_t u, int32_t v)
 {
-    int w = TEX_W >> lev, h = TEX_H >> lev;
-    float gu = fu * w - 0.5f, gv = fvn * h - 0.5f;
-    int u0 = (int)floorf(gu), v0 = (int)floorf(gv);
-    int wu = (int)((gu - u0) * 256), wv = (int)((gv - v0) * 256);
+    const int w = TEX_W >> lev, h = TEX_H >> lev;
+    const int32_t gu = (int32_t)mulhu(u, (uint32_t)w << 16) - 0x8000, gv = (v >> lev) - 0x8000;
+    int u0 = gu >> 16, v0 = gv >> 16;
+    int wu = (gu >> 8) & 255, wv = (gv >> 8) & 255;
     if (u0 < 0) u0 += w;
     int u1 = u0 + 1 < w ? u0 + 1 : 0, v1 = v0 + 1 < h ? v0 + 1 : h - 1;
     if (v0 < 0) v0 = 0;
@@ -979,36 +1109,52 @@ static inline int bil_global_lights(int lev, float fu, float fvn)
     return (top * (256 - wv) + bot * wv + 32768) >> 16;
 }
 
+#define SW_HAZE_DAY SPREAD(gfx_pack(12 + 120, 18 + 160, 40 + 210))
+#define DEG_Q (1 << 16)   // degrees Q16
+#define TEN_DEG (10 * DEG_Q)
+
+// Distance from x (degrees Q16, |x| <= 180°) to the nearest multiple of 10°.
+static inline int32_t to_ten(int32_t x)
+{
+    int32_t r = (int32_t)((uint32_t)(x + 100 * TEN_DEG) % TEN_DEG);
+    return r < TEN_DEG / 2 ? r : TEN_DEG - r;
+}
+
+// The tiles a row of blocks last used (lookups are per tile, not per block).
+typedef struct { int key, lkey, llev; const uint16_t *terrain; const uint8_t *lit; } tile_memo_t;
+
 // Ground colour, in packed RGB565 integer steps: terrain (high-res tile levels near the camera,
 // the global texture beyond), night with city lights, graticule, aerial haze. dq: the block's
 // ordered-dither threshold (DQ).
-static void pilot_shade(const rctx_t *c, pp_t *p, uint32_t dq)
+static uint16_t pilot_shade(const rctx_t *c, const pq_t *p, uint32_t dq, tile_memo_t *memo)
 {
     const uint32_t d = dq5(dq) << 3;   // the same threshold, Q8
-    float fu = p->fu + 2;
-    fu -= (float)(int)fu;
-    float fvn = fminf(0.9999f, fmaxf(0, p->fv * (1.0f / TEX_H)));
     // Ground footprint of the 2x2 block and the texture level that matches it. Toward the
     // horizon the footprint is long in depth only (fp, stretched by 1 / cos incidence) and one
-    // pixel across: their geometric mean picks the level, as the longer side alone would blur.
-    const float q = p->t * c->pix_ang * p->fp, sfp = 2 * q * rsqrt_fast(fmaxf(q, 1e-6f)), T = HI_TEXEL_KM;
-    const int tl = sfp < 2 * T ? 0 : sfp < 4 * T ? 1 : sfp < 8 * T ? 2 : -1;
+    // pixel across: their geometric mean sqrt(t · pixel angle · fp) picks the level, as the
+    // longer side alone would blur. Compared as t · fp against the squared level sizes.
+    const int32_t q = (int32_t)(((int64_t)p->t * p->fp) >> 4);   // t · fp, km² Q8 (64 bit: high orbits)
+    const int tl = q < c->qt[0] ? 0 : q < c->qt[1] ? 1 : q < c->qt[2] ? 2 : -1;
+    // The high-resolution tile under the sample and the position in it (level-0 texels Q16).
     int key = -1;
-    float fx = 0, fy = 0;
-    const uint16_t *tile = NULL;
-    if (tl >= 0 && p->t < c->hi_max_t) {
-        key = tiles_key_f(fu, fvn, &fx, &fy);
-        tile = tiles_terrain(key, p->fp);
+    int32_t fx = 0, fy = 0;
+    if (tl >= 0 && p->t < c->hi_max_tq) {
+        const int row = (p->v * HI_ROWS) >> 26;   // (fv / TEX_H) · rows
+        const int cols = HI_ROW_COLS[row];
+        const int col = (int)mulhu(p->u, cols);
+        fy = (int32_t)(((int64_t)p->v * (HI_ROWS * HI_T)) >> 10) - row * (HI_T << 16);
+        fx = (int32_t)mulhu(p->u, (uint32_t)(cols * HI_T) << 16) - col * (HI_T << 16);
+        key = HI_ROW_START[row] + col;
+        if (key != memo->key) { memo->key = key; memo->terrain = tiles_terrain(key, p->fp * (1 / 256.0f)); }
     }
     uint32_t x;
-    if (tile) {
-        const uint16_t *lv = tile + (tl == 0 ? 0 : tl == 1 ? HI_T0_PX : HI_T0_PX + HI_T1_PX);
-        const float sc = tl == 0 ? 1 : tl == 1 ? 0.5f : 0.25f;
-        x = bil565(lv, HI_T >> tl, fx * sc, fy * sc);
+    if (key >= 0 && memo->terrain) {
+        const uint16_t *lv = memo->terrain + (tl == 0 ? 0 : tl == 1 ? HI_T0_PX : HI_T0_PX + HI_T1_PX);
+        x = bil565(lv, HI_T >> tl, fx >> tl, fy >> tl);
     } else {
-        x = bil_global(sfp > 2 * LIGHT_TEXEL_KM ? 1 : 0, fu, fvn);
+        x = bil_global(q > c->ql[0] ? 1 : 0, p->u, p->v);
     }
-    const int sunq = (int)(p->sun * 4096);
+    const int sunq = p->sun;
     int litq = 256;   // day side, for the haze colour
     if (sunq < NIGHT_HI) {
         int k = sunq - NIGHT_LO;
@@ -1016,46 +1162,44 @@ static void pilot_shade(const rctx_t *c, pp_t *p, uint32_t dq)
         litq = 256 - night_n[k];
         // City lights: tile levels 0 / 1 near the camera, else the global mip chain.
         int L = -1;
-        const int ll = sfp < 2 * T ? 0 : sfp < 4 * T ? 1 : -1;
-        if (ll >= 0) {
-            if (key < 0) key = tiles_key_f(fu, fvn, &fx, &fy);
-            const uint8_t *lt = tiles_lights(key, ll, p->fp);
-            if (lt) L = ll ? bil8(lt, HI_T / 2, fx * 0.5f, fy * 0.5f) : bil8(lt, HI_T, fx, fy);
+        const int ll = q < c->qt[0] ? 0 : q < c->qt[1] ? 1 : -1;
+        if (ll >= 0 && key >= 0) {
+            if (key != memo->lkey || ll != memo->llev) { memo->lkey = key; memo->llev = ll; memo->lit = tiles_lights(key, ll, p->fp * (1 / 256.0f)); }
+            if (memo->lit) L = ll ? bil8(memo->lit, HI_T / 2, fx >> 1, fy >> 1) : bil8(memo->lit, HI_T, fx, fy);
         }
-        if (L < 0) {
-            float ratio = sfp * (1.0f / LIGHT_TEXEL_KM);
-            L = bil_global_lights(ratio <= 2 ? 0 : ratio <= 4 ? 1 : ratio <= 8 ? 2 : 3, fu, fvn);
-        }
+        if (L < 0) L = bil_global_lights(q <= c->ql[0] ? 0 : q <= c->ql[1] ? 1 : q <= c->ql[2] ? 2 : 3, p->u, p->v);
         x = sw_night(x, sunq, L, dq);
     }
     // Graticule every 10°, about one pixel wide, antialiased: blended by how close the block's
     // centre is to the line (a hard on/off line crawls as the view moves).
-    float fpd = p->t * c->pix_ang * (57.29578f / EARTH_R_KM);   // one pixel, in degrees
-    float la = 90 - fvn * 180, lo = fu * 360 - 180;
-    float dlat = fabsf(la - (float)((int)(la * 0.1f + 100.5f) - 100) * 10);
-    float dlon = fabsf(lo - (float)((int)(lo * 0.1f + 100.5f) - 100) * 10) * p->cl;
-    float dm = fminf(dlat, dlon), w = 1.5f * fpd;
+    const int32_t la = 90 * DEG_Q - (int32_t)(((uint32_t)p->v * 45u) >> 8);   // 90° - fv / TEX_H · 180°
+    const int32_t lo = (int32_t)mulhu(p->u, 360u << 16) - 180 * DEG_Q;
+    const int32_t dlat = to_ten(la), dlon = (to_ten(lo) * p->cl) >> 12;
+    const int32_t dm = dlat < dlon ? dlat : dlon, w = (p->t * c->grat_w) >> 12;   // w: 1.5 px
     if (dm < w) {   // (rarely true: the division only near a line)
-        float cov = 1 - dm / w;
+        float cov = 1 - (float)dm / w;
         uint32_t a = (uint32_t)(cov * 7 + (d >> 5) * (1.0f / 8));   // up to ~0.2 toward light grey
         if (a) x = ((x * (32 - a) + SPREAD(gfx_pack(225, 230, 235)) * a) >> 5) & SW_MASK;
     }
-    // Aerial haze toward the horizon (dithered: 32 steps would band).
-    float hq = fminf(1, p->t * c->inv_t_horizon), hq2 = hq * hq;
-    int a = (int)(19.2f * hq2 * hq2 * hq + d * (1.0f / 256));   // 0.6 · hq⁵ · 32
+    // Aerial haze toward the horizon, 0.6 · (t / t_horizon)⁵ (dithered: 32 steps would band).
+    uint32_t hq = ((uint32_t)p->t * c->haze_k) >> 16;   // Q15
+    if (hq > 32768) hq = 32768;
+    const uint32_t h2 = (hq * hq) >> 15, h5 = (((h2 * h2) >> 15) * hq) >> 15;
+    const int a = (int)((h5 * 4915 >> 15) + d) >> 8;   // 19.2 = 0.6 · 32, Q8
     if (a) {
-        uint32_t hc = SPREAD(gfx_pack(12 + (120 * litq >> 8), 18 + (160 * litq >> 8), 40 + (210 * litq >> 8)));
+        uint32_t hc = litq == 256 ? SW_HAZE_DAY : SPREAD(gfx_pack(12 + (120 * litq >> 8), 18 + (160 * litq >> 8), 40 + (210 * litq >> 8)));
         x = ((x * (32 - a) + hc * a) >> 5) & SW_MASK;
     }
-    p->px = UNSPREAD(x);
+    return UNSPREAD(x);
 }
 
-static inline uint16_t pilot_finish(const pp_t *p, float x, float y)
+// Rim vignette at (dx, dy) from the centre (whole pixels): pilot_rim on (r / c)²,
+// RIM_LUT_N · 4 / S² as 8285 / 2^20.
+static inline uint16_t pilot_finish(uint16_t px, int dx, int dy)
 {
-    float dx = x - CX, dy = y - CY, q = (dx * dx + dy * dy) * (4.0f / (S * S));
-    int m = pilot_rim[q >= 1 ? RIM_LUT_N : (int)(q * RIM_LUT_N)];
-    if (m >= 256) return p->px;
-    return UNSPREAD(((SPREAD(p->px) * ((m + 4) >> 3)) >> 5) & SW_MASK);
+    const int i = ((dx * dx + dy * dy) * 8285) >> 20;
+    const int m = pilot_rim[i < RIM_LUT_N ? i : RIM_LUT_N];
+    return UNSPREAD(((SPREAD(px) * ((m + 4) >> 3)) >> 5) & SW_MASK);
 }
 
 static inline bool pilot_span_linear(const pp_t *a, const pp_t *b, float *du)
@@ -1077,59 +1221,86 @@ static void pilot_rows_half(const rctx_t *c, int by)
     int y0 = 2 * by;
     uint16_t *row0 = c->fb + y0 * S, *row1 = row0 + S;
     const uint16_t bg = gfx_pack(PILOT_BG.r, PILOT_BG.g, PILOT_BG.b);
-    for (int x = 0; x < S; x++) row0[x] = row1[x] = bg;
     int x0 = pspan_x0[y0] < pspan_x0[y0 + 1] ? pspan_x0[y0] : pspan_x0[y0 + 1];
     int x1 = pspan_x1[y0] > pspan_x1[y0 + 1] ? pspan_x1[y0] : pspan_x1[y0 + 1];
     const float Ys = (CY - y0 - 1.0f) * inv_c;
     const int bx0 = x0 / 2, bx1 = (x1 + 1) / 2;
+    // Background outside the blocks (the edge blocks fill their uncovered pixels themselves).
+    const int bg0 = bx1 > bx0 ? 2 * bx0 : S, bg1 = bx1 > bx0 ? 2 * bx1 : S;
+    for (int x = 0; x < bg0; x++) row0[x] = row1[x] = bg;
+    for (int x = bg1; x < S; x++) row0[x] = row1[x] = bg;
     if (bx1 <= bx0) return;
-    // Blocks wholly inside the round screen need no edge coverage.
+    // Blocks wholly inside the round screen need no edge coverage: those with
+    // max(|x + 0.5 - CX|, |x + 1.5 - CX|)² <= hin2, i.e. block columns x in [xin0, xin1].
     const float rin = S / 2.0f - 1.5f, dyc = fmaxf(fabsf(y0 + 0.5f - CY), fabsf(y0 + 1.5f - CY));
-    const float hin2 = rin * rin - dyc * dyc;
+    const float hin2 = rin * rin - dyc * dyc, hin = hin2 > 0 ? sqrtf(hin2) : -1;
+    const int xin0 = hin < 0 ? S : (int)ceilf(CX - 0.5f - hin), xin1 = hin < 0 ? -S : (int)floorf(CX - 1.5f + hin);
+    // The rim vignette starts at 0.75 of the radius (pilot_rim is 255 inside: no change): it
+    // applies outside (x + 1 - CX)² < rim_in2, x in (xr0, xr1).
+    const float dyb = y0 + 1.0f - CY, rim_in2 = (0.75f * S / 2) * (0.75f * S / 2) - dyb * dyb - 1.0f;
+    const float rr = rim_in2 > 0 ? sqrtf(rim_in2) : -1;
+    const int xr0 = rr < 0 ? S : (int)floorf(CX - 1 - rr), xr1 = rr < 0 ? -S : (int)ceilf(CX - 1 + rr);
     pp_t a, b, p;
+    pq_t qa, qb, q;
+    tile_memo_t memo = {-1, -1, -1, NULL, NULL};
     pilot_ray(c, (2 * bx0 + 1.0f - CX) * inv_c, Ys, &a);
+    if (a.ground) pilot_fixed(&a, &qa);
     for (int k0 = bx0; k0 < bx1;) {
         int m = bx1 - k0 < PSPAN ? bx1 - k0 : PSPAN;
         pilot_ray(c, (2 * (k0 + m) + 1.0f - CX) * inv_c, Ys, &b);
+        if (b.ground) pilot_fixed(&b, &qb);
         float du;
         bool lin = pilot_span_linear(&a, &b, &du);
+        // Linear: fixed-point steps from a to b (the turn by the shorter way round).
+        pq_t dq = {0};
+        if (lin) {
+            const float im = 1.0f / m;
+            dq.u = (uint32_t)(int32_t)(du * 4294967296.0f * im);
+            if (m == PSPAN) {
+                dq.v = (qb.v - qa.v) >> 2; dq.sun = (qb.sun - qa.sun) >> 2; dq.t = (qb.t - qa.t) >> 2;
+                dq.fp = (qb.fp - qa.fp) >> 2; dq.cl = (qb.cl - qa.cl) >> 2;
+            } else {
+                dq.v = (int32_t)((qb.v - qa.v) * im); dq.sun = (int32_t)((qb.sun - qa.sun) * im);
+                dq.t = (int32_t)((qb.t - qa.t) * im); dq.fp = (int32_t)((qb.fp - qa.fp) * im);
+                dq.cl = (int32_t)((qb.cl - qa.cl) * im);
+            }
+            q = qa;
+        }
         // Sky at both ends: the sky's colour changes slowly (glow along the limb), blend it.
         const bool sky = !a.ground && !b.ground;
         const uint32_t sa = SPREAD(a.px), sb = SPREAD(b.px);
         for (int k = 0; k < m; k++) {
             int bx = k0 + k, x = 2 * bx;
-            if (k == 0) p = a;
-            else if (sky && m == PSPAN) {
-                p.ground = false;
-                p.px = UNSPREAD(((sa * (PSPAN - k) + sb * k) >> 2) & SW_MASK);
+            const uint32_t dth = DQ[by & 3][bx & 3];
+            uint16_t px;
+            if (k == 0) {
+                px = a.ground ? pilot_shade(c, &qa, dth, &memo) : a.px;
+            } else if (sky && m == PSPAN) {
+                px = UNSPREAD(((sa * (PSPAN - k) + sb * k) >> 2) & SW_MASK);
             } else if (lin) {
-                float f = (float)k / m;
-                p.ground = true;
-                p.fu = a.fu + du * f; p.fu -= floorf(p.fu);
-                p.fv = a.fv + (b.fv - a.fv) * f;
-                p.sun = a.sun + (b.sun - a.sun) * f;
-                p.t = a.t + (b.t - a.t) * f;
-                p.fp = a.fp + (b.fp - a.fp) * f;
-                p.cl = a.cl + (b.cl - a.cl) * f;
+                q.u += dq.u; q.v += dq.v; q.sun += dq.sun; q.t += dq.t; q.fp += dq.fp; q.cl += dq.cl;
+                px = pilot_shade(c, &q, dth, &memo);
             } else {
                 pilot_ray(c, (x + 1.0f - CX) * inv_c, Ys, &p);
+                if (p.ground) { pq_t qe; pilot_fixed(&p, &qe); px = pilot_shade(c, &qe, dth, &memo); }
+                else px = p.px;
             }
-            if (p.ground) pilot_shade(c, &p, DQ[by & 3][bx & 3]);
-            uint16_t px = pilot_finish(&p, x + 1.0f, y0 + 1.0f);
-            float dxc = fmaxf(fabsf(x + 0.5f - CX), fabsf(x + 1.5f - CX));
-            if (dxc * dxc <= hin2) {
-                row0[x] = row0[x + 1] = row1[x] = row1[x + 1] = px;
+            if (x <= xr0 || x >= xr1) px = pilot_finish(px, x + 1 - (int)CX, y0 + 1 - (int)CY);
+            if (x >= xin0 && x <= xin1) {
+                const uint32_t pp = px | (uint32_t)px << 16;   // x is even: aligned pairs
+                *(uint32_t *)(row0 + x) = pp;
+                *(uint32_t *)(row1 + x) = pp;
                 continue;
             }
-            for (int q = 0; q < 4; q++) {
-                int xx = x + (q & 1), yy = y0 + (q >> 1);
+            for (int e = 0; e < 4; e++) {
+                int xx = x + (e & 1), yy = y0 + (e >> 1);
                 float ddx = xx + 0.5f - CX, ddy = yy + 0.5f - CY;
                 float cov = S / 2.0f + 0.5f - sqrtf(ddx * ddx + ddy * ddy);
-                if (cov <= 0) continue;
-                c->fb[yy * S + xx] = cov >= 1 ? px : edge_mix(px, bg, (int)(cov * 255));
+                c->fb[yy * S + xx] = cov <= 0 ? bg : cov >= 1 ? px : edge_mix(px, bg, (int)(cov * 255));
             }
         }
         a = b;
+        qa = qb;
         k0 += m;
     }
 }
@@ -1162,9 +1333,11 @@ rgb_t globe_shaded_stroke(int x, int y, rgb_t col, bool flat, float *alpha)
 {
     if ((unsigned)y >= S || x < span_x0[y] || x >= span_x1[y]) { *alpha = 0; return col; }
     // The rim fade from the full table (external RAM) only near the edge; the light per cell.
-    float dx = x + 0.5f - CX, dy = y + 0.5f - CY;
+    // (in half pixels from the centre, integers: 2·(x + 0.5 - CX))
+    const int dx = 2 * x + 1 - (int)(2 * CX), dy = 2 * y + 1 - (int)(2 * CY);
+    static const int RIN2 = (int)(4 * (GLOBE_R - 3) * (GLOBE_R - 3));
     *alpha = 1;
-    if (dx * dx + dy * dy > (R - 3) * (R - 3)) *alpha = cover[row_off[y] + x - span_x0[y]] * (1 / 255.0f);
+    if (dx * dx + dy * dy > RIN2) *alpha = cover[row_off[y] + x - span_x0[y]] * (1 / 255.0f);
     uint16_t l = shade_grid[flat][(y / SG_C) * SG_N + x / SG_C];
     uint32_t m = (l & 31) + 1, add = ((l >> 5) & 31) << 3;
     int r = ((col.r * m) >> 5) + add, g = ((col.g * m) >> 5) + add, b = ((col.b * m) >> 5) + add;
@@ -1235,6 +1408,10 @@ static void bg_row(int y, const void *vc)
     else ortho_row_full(c, y);
 }
 
+static void (*bake_fn)(uint16_t *fb, const globe_view_t *v);
+
+void globe_cache_bake(void (*fn)(uint16_t *fb, const globe_view_t *v)) { bake_fn = fn; }
+
 static void bg_task_fn(void *arg)
 {
     for (;;) {
@@ -1246,6 +1423,7 @@ static void bg_task_fn(void *arg)
         rctx_t c;
         rctx_init(&c, &v, cache[back], 0);
         pool_run(&bg_pool, bg_row, &c, S);
+        if (!cancel_bg && bake_fn) bake_fn(cache[back], &v);
         if (!cancel_bg) {
             render_ms_sum += (esp_timer_get_time() - t0) / 1000.0f;
             renders++;

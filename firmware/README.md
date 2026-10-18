@@ -127,11 +127,24 @@ refresh, so frames never tear.
   each 2x2 block samples the level matching its ground footprint (geometric mean of the
   across and along-view sizes) bilinearly, the global texture beyond. Point samples of a finer
   texture made coastlines and ridges shimmer as the view moved. The graticule is antialiased and
-  the haze dithered. (The strips are
-kept small so the renderer's internal RAM coexists with the Wi-Fi/ESP-Hosted stack. They must
-be in the main SRAM: the P4's low-power SRAM also counts as internal RAM but is several times
-slower, so a strip there quarters the frame rate. The console and network task stacks live in
-the low-power SRAM to leave the main SRAM to the strips and Wi-Fi.)
+  the haze dithered.
+- **Integer inner loops.** The cores issue in order and a float result takes ~5 cycles (a
+  division or square root ~23), so the per-pixel and per-block paths step in fixed point: the
+  pilot view's ground shading (tile lookup, bilinear filter, graticule, haze, rim vignette), the
+  half-resolution globe spans, thick strokes and hairlines. They avoid double precision (software
+  on this chip), libm calls and integer divisions.
+- **Lines on the still globe.** The background full-resolution render also gets the borders and
+  graticule printed on it (the same rasterizer, straight into the frame), so still frames neither
+  record nor draw them.
+- **Line sets.** While the globe moves, borders and graticule are recorded as compact hairline
+  segments binned per strip directly and drawn first in each strip; the recording is split
+  between the two cores (line sets on one, everything above them on the other).
+
+(The strips are kept small so the renderer's internal RAM coexists with the Wi-Fi/ESP-Hosted
+stack. They must be in the main SRAM: the P4's low-power SRAM also counts as internal RAM but is
+several times slower, so a strip there quarters the frame rate. The console and network task
+stacks live in the low-power SRAM, the orbit snapshots in PSRAM and the start-up code in flash,
+to leave the main SRAM to the strips and Wi-Fi.)
 
 - Earth spin is drawn at full resolution every frame (the globe turns all the time).
 - Ground, satellite reference and flat earth show a full-resolution globe rendered by a
@@ -144,13 +157,14 @@ Frame rates (fps) measured with `tools/perf_test.py`:
 
 | View | still | panning |
 |---|---|---|
-| Earth spin | 13 | 19–20 |
-| Ground reference | 30 | 21 |
-| Satellite reference | 20 | 19 |
-| Pilot reference | 13 | 12 |
-| Flat earth | 25 | 17 |
+| Earth spin | 17 | 22 |
+| Ground reference | 30 (cap) | 23 |
+| Satellite reference | 26 | 23 |
+| Pilot reference | 19 | 17 |
+| Flat earth | 30 (cap) | 19 |
 
 (`perf_test.py --time 1792300000`, a fixed scene; the night side costs more, so other times
-differ.) Per frame on the busier core, globe pixels take ~50 ms in Earth spin and ~60 ms in the
-pilot view (CPU-bound: ~140 cycles a pixel, the per-pixel light table is only ~10 % of it), the
-vector layers ~12 ms (17 ms flat earth) and the copy out ~6 ms.
+differ, and the spin angle at the time of the measurement moves Earth spin by a frame or so. Still
+views are capped at `FRAME_HZ`, 30.) Per frame on the busier core, globe pixels take ~35 ms in
+Earth spin and in the pilot view and ~19 ms at half resolution while a globe pans, the vector
+layers 5–14 ms, the recording 3–6 ms and the copy out ~5 ms.

@@ -52,6 +52,9 @@ void globe_cache_cancel(void);
 const uint16_t *globe_cache_hold(globe_view_t *v, double *t);
 void globe_cache_release(void);
 void globe_cache_stats(int *count, float *avg_ms);
+// Called by the background task on each finished cache frame before it is shown (lines
+// printed on the globe), with the view it was rendered for.
+void globe_cache_bake(void (*fn)(uint16_t *fb, const globe_view_t *v));
 
 // Stroke colour lit like the surface under pixel (x, y) (sphere lighting or the flat map's
 // vignette), and its coverage by the disc in *alpha (0 outside).

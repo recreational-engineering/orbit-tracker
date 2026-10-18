@@ -30,6 +30,24 @@ typedef struct {
 } list_t;
 
 static list_t lists[2];
+
+// Hairlines of the surface line sets (borders, graticule): recorded on one core before
+// anything else, binned per strip directly and replayed first in each strip. A set holds the
+// stroke parameters its segments share.
+typedef struct { int16_t x0, y0, x1, y1; rgb_t c; uint8_t set; uint8_t s0, s1; uint16_t phase; } hseg_t;   // 16 B
+typedef struct { float w, on, off, period, inv_period; int a256; } hset_t;
+#define HSEG_CAP 9000
+#define HBIN_CAP (2 * HSEG_CAP)
+#define HSET_CAP 4
+static hseg_t *hsegs;
+static int nhseg, nhset;
+static hset_t hsets[HSET_CAP];
+static uint16_t *hbin;
+static int hbin_start[DL_NSTRIPS + 1];
+// The run being appended to, per core, kept in internal RAM (the items and the arena are in
+// PSRAM): its item, the list state right after its last segment, and its parameters as bits.
+typedef struct { item_t *it; int n; uint32_t used, w, on, off; int ylo, yhi, span; } run_t;
+static run_t runs[2];
 static uint32_t *bin_idx;   // list << 31 | index
 static int bin_start[DL_NSTRIPS + 1];
 
@@ -42,11 +60,14 @@ void dl_init(void)
         lists[i].arena = heap_caps_malloc(ARENA_CAP, MALLOC_CAP_SPIRAM);
     }
     bin_idx = heap_caps_malloc(BIN_CAP * sizeof(uint32_t), MALLOC_CAP_SPIRAM);
+    hsegs = heap_caps_malloc(HSEG_CAP * sizeof(hseg_t), MALLOC_CAP_SPIRAM);
+    hbin = heap_caps_malloc(HBIN_CAP * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
 }
 
 void dl_begin(void)
 {
-    for (int i = 0; i < 2; i++) { lists[i].n = 0; lists[i].used = 0; }
+    for (int i = 0; i < 2; i++) { lists[i].n = 0; lists[i].used = 0; runs[i].it = NULL; }
+    nhseg = nhset = 0;
 }
 
 int dl_count(void) { return lists[0].n + lists[1].n; }
@@ -73,53 +94,63 @@ static void *arena(uint32_t n, uint32_t *off)
     return l->arena + *off;
 }
 
-// Thin segments in a row with the same width, alpha and dash pattern go into one run item
-// of compact segments (coordinates in 1/16 px), as long as the run stays within a few strips.
-typedef struct { int16_t x0, y0, x1, y1, ylo, yhi; rgb_t c; uint8_t pad; uint16_t phase, pad2; } tseg_t;
+// Thin segments in a row with the same width and dash pattern go into one run item of compact
+// segments (coordinates in 1/16 px, alpha per segment: strokes that fade along a line), as
+// long as the run stays within a few strips.
+typedef struct { int16_t x0, y0, x1, y1, ylo, yhi; rgb_t c; uint8_t pad; uint16_t phase, a256; } tseg_t;
 
 static inline int strip_span(int ylo, int yhi) { return yhi / DL_STRIP_H - ylo / DL_STRIP_H + 1; }
 
 static inline int16_t q4(float v) { return (int16_t)((int)(v * 16 + 32768.5f) - 32768); }
 
+static inline uint32_t fbits(float f) { union { float f; uint32_t u; } v = {f}; return v.u; }
+
 static bool thin_run(float x0, float y0, float x1, float y1, float w, rgb_t c, float a, const gfx_dash_t *dash)
 {
-    if (fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(y0), fabsf(y1))) > 2000) return false;
+    if (!(fabsf(x0) <= 2000 && fabsf(x1) <= 2000 && fabsf(y0) <= 2000 && fabsf(y1) <= 2000)) return false;
     float m = w * 0.5f + 2;
     float flo = fminf(y0, y1) - m, fhi = fmaxf(y0, y1) + m;
     if (fhi < 0 || flo >= GFX_H) return true;
     int ylo = (int)(flo + 4096.0f) - 4096, yhi = 4096 - (int)(4096.0f - fhi);   // floor, ceil
     if (ylo < 0) ylo = 0;
     if (yhi > GFX_H - 1) yhi = GFX_H - 1;
-    float on = dash ? dash->on : 0, off = dash ? dash->off : 0;
-    list_t *l = cur();
-    item_t *it = l->n ? &l->items[l->n - 1] : NULL;
-    bool append = it && it->kind == K_TRUN && it->n < 65000 && it->w == w && it->a == a && it->p0 == on && it->p1 == off &&
-                  l->used == it->data + it->n * sizeof(tseg_t) && l->used + sizeof(tseg_t) <= ARENA_CAP;
+    const float on = dash ? dash->on : 0, off = dash ? dash->off : 0;
+    const int core = esp_cpu_get_core_id();
+    list_t *l = &lists[core];
+    run_t *r = &runs[core];
+    if (l->used + sizeof(tseg_t) > ARENA_CAP) return true;
+    bool append = r->it && r->n == l->n && r->used == l->used && r->it->n < 65000 && r->w == fbits(w) &&
+                  r->on == fbits(on) && r->off == fbits(off);
+    const int own = strip_span(ylo, yhi);
     if (append) {
-        int lo = it->ylo < ylo ? it->ylo : ylo, hi = it->yhi > yhi ? it->yhi : yhi;
-        int span = strip_span(lo, hi), keep = strip_span(it->ylo, it->yhi), own = strip_span(ylo, yhi);
-        append = span <= (keep > own ? keep : own) || span <= 2;
-        if (append) { it->ylo = lo; it->yhi = hi; }
+        int lo = r->ylo < ylo ? r->ylo : ylo, hi = r->yhi > yhi ? r->yhi : yhi;
+        int span = strip_span(lo, hi);
+        append = span <= (r->span > own ? r->span : own) || span <= 2;
+        if (append) { r->ylo = lo; r->yhi = hi; r->span = span; r->it->ylo = lo; r->it->yhi = hi; }
     }
     if (!append) {
-        if (l->n >= ITEM_CAP || l->used + sizeof(tseg_t) > ARENA_CAP) return true;
-        it = &l->items[l->n++];
+        if (l->n >= ITEM_CAP) return true;
+        item_t *it = &l->items[l->n++];
         memset(it, 0, sizeof *it);
         it->kind = K_TRUN;
         it->ylo = ylo; it->yhi = yhi;
         it->w = w; it->a = a; it->p0 = on; it->p1 = off;
         it->data = l->used;
+        *r = (run_t){it, l->n, 0, fbits(w), fbits(on), fbits(off), ylo, yhi, own};
     }
     tseg_t *sg = (tseg_t *)(l->arena + l->used);
     l->used += sizeof(tseg_t);
-    it->n++;
-    sg->x0 = q4(x0); sg->y0 = q4(y0); sg->x1 = q4(x1); sg->y1 = q4(y1);
-    sg->ylo = ylo; sg->yhi = yhi; sg->c = c;
-    sg->phase = 0;
+    r->used = l->used;
+    r->it->n++;
+    tseg_t t;
+    t.x0 = q4(x0); t.y0 = q4(y0); t.x1 = q4(x1); t.y1 = q4(y1);
+    t.ylo = ylo; t.yhi = yhi; t.c = c; t.pad = 0;
+    t.phase = 0; t.a256 = (uint16_t)(a * 256.0f + 0.5f);
     if (dash) {
         float pos = fmaxf(dash->pos, 0), period = on + off;
-        sg->phase = (uint16_t)((pos - period * (int)(pos / period)) * 16);
+        t.phase = (uint16_t)((pos - period * (int)(pos / period)) * 16);
     }
+    *sg = t;
     return true;
 }
 
@@ -242,8 +273,55 @@ void dl_dim(float a)
     it->a = a;
 }
 
+int dl_hair_set(float w, float a, float on, float off)
+{
+    if (nhset >= HSET_CAP) return -1;
+    hset_t *h = &hsets[nhset];
+    h->w = w; h->on = on; h->off = off; h->period = on + off;
+    h->inv_period = on > 0 ? 1.0f / (on + off) : 0;
+    h->a256 = (int)(a * 256.0f + 0.5f);
+    return nhset++;
+}
+
+void dl_hair(int set, float x0, float y0, float x1, float y1, rgb_t c, float dash_pos)
+{
+    if (set < 0 || nhseg >= HSEG_CAP) return;
+    const hset_t *h = &hsets[set];
+    if (!(fabsf(x0) <= 2000 && fabsf(x1) <= 2000 && fabsf(y0) <= 2000 && fabsf(y1) <= 2000)) return;
+    const float m = h->w * 0.5f + 2;
+    const float flo = fminf(y0, y1) - m, fhi = fmaxf(y0, y1) + m;
+    if (fhi < 0 || flo >= GFX_H) return;
+    int ylo = (int)(flo + 4096.0f) - 4096, yhi = 4096 - (int)(4096.0f - fhi);   // floor, ceil
+    if (ylo < 0) ylo = 0;
+    if (yhi > GFX_H - 1) yhi = GFX_H - 1;
+    hseg_t *sg = &hsegs[nhseg++];
+    sg->x0 = q4(x0); sg->y0 = q4(y0); sg->x1 = q4(x1); sg->y1 = q4(y1);
+    sg->c = c; sg->set = set;
+    sg->s0 = ylo / DL_STRIP_H; sg->s1 = yhi / DL_STRIP_H;
+    sg->phase = 0;
+    if (h->on > 0) {   // as thin_run: the phase within the period, 1/16
+        float pos = fmaxf(dash_pos, 0);
+        sg->phase = (uint16_t)((pos - h->period * (int)(pos * h->inv_period)) * 16);
+    }
+}
+
 void dl_finish(void)
 {
+    {   // the line sets' hairlines
+        int count[DL_NSTRIPS] = {0};
+        for (int i = 0; i < nhseg; i++)
+            for (int k = hsegs[i].s0; k <= hsegs[i].s1; k++) count[k]++;
+        hbin_start[0] = 0;
+        for (int k = 0; k < DL_NSTRIPS; k++) hbin_start[k + 1] = hbin_start[k] + count[k];
+        if (hbin_start[DL_NSTRIPS] > HBIN_CAP) {
+            memset(hbin_start, 0, sizeof hbin_start);
+        } else {
+            int fill[DL_NSTRIPS];
+            memcpy(fill, hbin_start, sizeof fill);
+            for (int i = 0; i < nhseg; i++)
+                for (int k = hsegs[i].s0; k <= hsegs[i].s1; k++) hbin[fill[k]++] = i;
+        }
+    }
     int count[DL_NSTRIPS] = {0};
     for (int l = 0; l < 2; l++)
         for (int i = 0; i < lists[l].n; i++) {
@@ -264,6 +342,12 @@ void dl_finish(void)
 
 void dl_replay(int strip)
 {
+    for (int b = hbin_start[strip]; b < hbin_start[strip + 1]; b++) {
+        const hseg_t *sg = &hsegs[hbin[b]];
+        const hset_t *h = &hsets[sg->set];
+        gfx_thin_seg(sg->x0 * (1 / 16.0f), sg->y0 * (1 / 16.0f), sg->x1 * (1 / 16.0f), sg->y1 * (1 / 16.0f),
+                     h->w, sg->c, h->a256, h->on, h->off, sg->phase * (1 / 16.0f));
+    }
     for (int b = bin_start[strip]; b < bin_start[strip + 1]; b++) {
         uint32_t ref = bin_idx[b];
         const list_t *l = &lists[ref >> 31];
@@ -296,11 +380,10 @@ void dl_replay(int strip)
             int ylo, yhi;
             gfx_get_clip_rows(&ylo, &yhi);
             const tseg_t *sg = (const tseg_t *)data;
-            int a256 = (int)(it->a * 256.0f + 0.5f);
             for (int i = 0; i < it->n; i++, sg++) {
                 if (sg->yhi < ylo || sg->ylo >= yhi) continue;
                 gfx_thin_seg(sg->x0 * (1 / 16.0f), sg->y0 * (1 / 16.0f), sg->x1 * (1 / 16.0f), sg->y1 * (1 / 16.0f),
-                             it->w, sg->c, a256, it->p0, it->p1, sg->phase * (1 / 16.0f));
+                             it->w, sg->c, sg->a256, it->p0, it->p1, sg->phase * (1 / 16.0f));
             }
             break;
         }

@@ -1,6 +1,7 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -15,7 +16,8 @@ static const char *TAG = "model";
 #define PASS_SEARCH_STEP_S 20
 #define PASS_SEARCH_SPAN_S (4 * 3600)
 
-static snapshot_t snaps[2];
+// In PSRAM (2 x ~20 KB): the main SRAM is kept for the render strips and Wi-Fi.
+static snapshot_t *snaps;
 static volatile int published = -1;
 static volatile double requested_t;
 static volatile bool busy;
@@ -232,6 +234,7 @@ bool model_set_omm(const omm_t *omm)
 void model_init(void)
 {
     orbit_lock = xSemaphoreCreateMutex();
+    snaps = heap_caps_calloc(2, sizeof(snapshot_t), MALLOC_CAP_SPIRAM);
     omm_t omm = {
         .epoch_unix = OMM_EPOCH_UNIX, .mean_motion = OMM_MEAN_MOTION, .eccentricity = OMM_ECCENTRICITY,
         .inclination = OMM_INCLINATION, .ra_of_asc_node = OMM_RA_OF_ASC_NODE,

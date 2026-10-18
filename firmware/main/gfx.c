@@ -2,13 +2,14 @@
 #include <string.h>
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
 #include <stdlib.h>
 #include "gfx.h"
 
 // One drawing context per CPU core, so a task on each core can draw at the same time.
 #define COV_LUT_K 16      // thin-stroke coverage table: entries per pixel of distance
 #define COV_LUT_N 48
-typedef struct {
+typedef struct gfx_ctx {
     uint16_t *fb;
     int ylo, yhi;           // rows this core draws: ylo <= y < yhi
     float acc[GFX_W + 1];   // polygon coverage row
@@ -18,6 +19,13 @@ typedef struct {
 
 static gfx_ctx_t ctxs[2];
 
+// ASCII glyphs by code point, per font (filled on a font's first use; 255: none). A string is
+// looked up three times per strip it touches (width, outline, fill): no linear search for them.
+#define GLYPH_FONTS 16
+typedef struct { const gfx_font_t *f; uint8_t idx[128]; } glyph_index_t;
+static glyph_index_t *glyph_index;   // PSRAM, GLYPH_FONTS entries
+static portMUX_TYPE glyph_mux = portMUX_INITIALIZER_UNLOCKED;
+
 static inline gfx_ctx_t *cur(void) { return &ctxs[esp_cpu_get_core_id()]; }
 static inline float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 static inline int imin(int a, int b) { return a < b ? a : b; }
@@ -26,6 +34,7 @@ static inline int imax(int a, int b) { return a > b ? a : b; }
 void gfx_init(void)
 {
     for (int i = 0; i < 2; i++) { ctxs[i].ylo = 0; ctxs[i].yhi = GFX_H; }
+    glyph_index = heap_caps_calloc(GLYPH_FONTS, sizeof(glyph_index_t), MALLOC_CAP_SPIRAM);
 }
 
 void gfx_target(uint16_t *target) { cur()->fb = target; }
@@ -80,34 +89,69 @@ static inline uint16_t unspread565(uint32_t v) { v &= 0x07E0F81Fu; return (uint1
 static const uint16_t dither_a[16] = {64, 1088, 320, 1344, 1600, 576, 1856, 832,
                                       448, 1472, 192, 1216, 1984, 960, 1728, 704};
 
+// One pixel of a hairline: weight w (alpha·4096), d the dither threshold for its position.
+static inline __attribute__((always_inline)) void hair_px(uint16_t *p, int32_t w, int d, uint32_t cs, uint16_t c16)
+{
+    int a = (w + d) >> 7;
+    if (!a) return;
+    *p = a >= 32 ? c16 : unspread565((cs * a + spread565(*p) * (32 - a)) >> 5);
+}
+
+// Hairline: the two pixels around the centre line, weighted by distance (Wu), with the
+// column's total coverage tot like the box filter of wider strokes. Fixed point (Q12) centre
+// and dash phase; specialised for the major axis and dashes (most strokes are hairlines).
+static inline __attribute__((always_inline)) void hairline(uint16_t *fb, int i0, int i1, int step, int32_t cq, int32_t dcq,
+                                                           int n_lo, int n_hi, uint32_t cs, uint16_t c16, int32_t tot,
+                                                           const bool steep, const bool dashed,
+                                                           int32_t ph, int32_t dph, int32_t per, int32_t onq)
+{
+    const int pitch = steep ? 1 : GFX_W;   // from pixel j to j + 1
+    for (int i = i0; i != i1; i += step, cq += dcq) {
+        if (dashed) {
+            int32_t p0 = ph;
+            ph += dph;
+            while (ph >= per) ph -= per;
+            if (p0 >= onq) continue;
+        }
+        int j = cq >> 12, f = cq & 4095;
+        uint16_t *p = steep ? fb + i * GFX_W + j : fb + j * GFX_W + i;
+        // dither_a >> 4 at (x, y) for j and j + 1
+        int x = steep ? j : i, y = steep ? i : j;
+        if (j >= n_lo && j < n_hi) hair_px(p, (4096 - f) * tot >> 12, dither_a[(y & 3) << 2 | (x & 3)] >> 4, cs, c16);
+        if (steep) x++; else y++;
+        if (j + 1 >= n_lo && j + 1 < n_hi) hair_px(p + pitch, f * tot >> 12, dither_a[(y & 3) << 2 | (x & 3)] >> 4, cs, c16);
+    }
+}
+
 static void thin_impl(gfx_ctx_t *g, float x0, float y0, float x1, float y1, float w, rgb_t c, int ai,
                       float on, float off, float dash_start, gfx_pixel_color_t color, void *ctx)
 {
     float dx = x1 - x0, dy = y1 - y0;
     if (fabsf(dx) + fabsf(dy) < 1e-4f) return;
-    if (g->lut_w != w) {   // coverage by perpendicular distance, for this width
-        g->lut_w = w;
-        for (int k = 0; k < COV_LUT_N; k++) g->lut[k] = (uint16_t)(band((k + 0.5f) / COV_LUT_K, w * 0.5f) * 256 + 0.5f);
-    }
     bool steep = fabsf(dy) > fabsf(dx);
-    // Work in (major, minor) coordinates; m runs along the major axis.
+    // Work in (major, minor) coordinates; m runs along the major axis. Divisions and square
+    // roots are slow on this FPU and most segments are a few pixels long: one reciprocal and
+    // one square root per segment (the length is |dm| · sec).
     float m0 = steep ? y0 : x0, n0 = steep ? x0 : y0, m1 = steep ? y1 : x1, n1 = steep ? x1 : y1;
-    float dm = m1 - m0, grad = (n1 - n0) / dm;
+    float dm = m1 - m0, inv_dm = 1.0f / dm, grad = (n1 - n0) * inv_dm;
     float sec = sqrtf(1 + grad * grad);          // 1 / cos of the angle to the major axis
-    float lut_k = COV_LUT_K / sec, reach = (w * 0.5f + 0.5f) * sec;
+    float reach = (w * 0.5f + 0.5f) * sec;
     // Pixel centres i + 0.5 between m0 and m1, half open in the stroke direction, limited to
-    // this core's rows: directly when the major axis is vertical, else to the columns whose
-    // centre line passes within reach of them.
+    // this core's rows: directly when the major axis is vertical, else (for a stroke that
+    // leaves the rows) to the columns whose centre line passes within reach of them.
     int m_lo = steep ? g->ylo : 0, m_hi = steep ? g->yhi : GFX_W;
     const int n_lo = steep ? 0 : g->ylo, n_hi = steep ? GFX_W : g->yhi;
-    if (!steep && fabsf(grad) > 1e-6f) {
-        float ia = m0 - 0.5f + (g->ylo - reach - n0) / grad, ib = m0 - 0.5f + (g->yhi + reach - n0) / grad;
-        if (ia > ib) { float t = ia; ia = ib; ib = t; }
-        ia = fmaxf(ia, -8.0f); ib = fminf(ib, GFX_W + 8.0f);
-        m_lo = imax(m_lo, ifloor(ia));
-        m_hi = imin(m_hi, ifloor(ib) + 2);
-    } else if (!steep && (n0 + reach < g->ylo || n0 - reach > g->yhi)) {
-        return;
+    if (!steep) {
+        float nmin = fminf(n0, n1), nmax = fmaxf(n0, n1);
+        if (nmax + reach < g->ylo || nmin - reach > g->yhi) return;
+        if ((nmin - reach < g->ylo || nmax + reach > g->yhi) && fabsf(grad) > 1e-6f) {
+            float ig = 1.0f / grad;
+            float ia = m0 - 0.5f + (g->ylo - reach - n0) * ig, ib = m0 - 0.5f + (g->yhi + reach - n0) * ig;
+            if (ia > ib) { float t = ia; ia = ib; ib = t; }
+            ia = fmaxf(ia, -8.0f); ib = fminf(ib, GFX_W + 8.0f);
+            m_lo = imax(m_lo, ifloor(ia));
+            m_hi = imin(m_hi, ifloor(ib) + 2);
+        }
     }
     int i0, i1, step;
     if (dm > 0) {
@@ -122,15 +166,19 @@ static void thin_impl(gfx_ctx_t *g, float x0, float y0, float x1, float y1, floa
         if (i0 <= i1) return;
     }
     float centre = n0 + (i0 + 0.5f - m0) * grad, dcentre = grad * step;
-    // Dash phase along the stroke, advanced per step.
+    // Dash phase along the stroke, advanced per step (by sec: the length per major-axis pixel).
     float phase = 0, dphase = 0, period = on + off;
     bool dashed = on > 0;
     if (dashed) {
-        float len = sqrtf(dx * dx + dy * dy);
-        phase = fmodf(dash_start + (i0 + 0.5f - m0) / dm * len, period);
-        if (phase < 0) phase += period;
-        dphase = len / fabsf(dm);
+        phase = dash_start + (i0 + 0.5f - m0) * inv_dm * fabsf(dm) * sec;
+        if (phase >= period || phase < 0) phase -= period * floorf(phase / period);
+        dphase = sec;
     }
+    if ((color || w > 1.0f) && g->lut_w != w) {   // coverage by perpendicular distance, for this width
+        g->lut_w = w;
+        for (int k = 0; k < COV_LUT_N; k++) g->lut[k] = (uint16_t)(band((k + 0.5f) / COV_LUT_K, w * 0.5f) * 256 + 0.5f);
+    }
+    const float lut_k = color || w > 1.0f ? COV_LUT_K / sec : 0;
     uint16_t *fb = g->fb;
     if (color) {
         for (int i = i0; i != i1; i += step, centre += dcentre) {
@@ -156,28 +204,15 @@ static void thin_impl(gfx_ctx_t *g, float x0, float y0, float x1, float y1, floa
     }
     const uint32_t cs = spread565(gfx_pack(c.r, c.g, c.b));
     if (w <= 1.0f) {
-        // Hairline: the two pixels around the centre line, weighted by distance (Wu), with
-        // the column's total coverage w·sec like the box filter below.
         const int32_t tot = (int32_t)(fminf(1.0f, w * sec) * ai * 16.0f);   // alpha·4096
-        int32_t cq = (int32_t)((centre - 0.5f) * 4096.0f), dcq = (int32_t)(dcentre * 4096.0f);
-        for (int i = i0; i != i1; i += step, cq += dcq) {
-            if (dashed) {
-                float ph = phase;
-                phase += dphase;
-                while (phase >= period) phase -= period;
-                if (ph >= on) continue;
-            }
-            int j = cq >> 12, f = cq & 4095;
-            int wt[2] = {4096 - f, f};
-            for (int h = 0; h < 2; h++, j++) {
-                if (j < n_lo || j >= n_hi) continue;
-                int x = steep ? j : i, y = steep ? i : j;
-                int a = ((wt[h] * tot >> 12) + (dither_a[(y & 3) << 2 | (x & 3)] >> 4)) >> 7;
-                if (!a) continue;
-                uint16_t *p = fb + y * GFX_W + x;
-                *p = a >= 32 ? unspread565(cs) : unspread565((cs * a + spread565(*p) * (32 - a)) >> 5);
-            }
-        }
+        const int32_t cq = (int32_t)((centre - 0.5f) * 4096.0f), dcq = (int32_t)(dcentre * 4096.0f);
+        const int32_t ph = (int32_t)(phase * 4096.0f), dph = (int32_t)(dphase * 4096.0f);
+        const int32_t per = (int32_t)(period * 4096.0f), onq = (int32_t)(on * 4096.0f);
+        const uint16_t c16 = unspread565(cs);
+#define HAIR(st, da) hairline(fb, i0, i1, step, cq, dcq, n_lo, n_hi, cs, c16, tot, st, da, ph, dph, per, onq)
+        if (steep) { if (dashed) HAIR(true, true); else HAIR(true, false); }
+        else { if (dashed) HAIR(false, true); else HAIR(false, false); }
+#undef HAIR
         return;
     }
     // Fixed point (Q12) along the minor axis; packed-colour blend with dithered 5-bit alpha.
@@ -224,6 +259,21 @@ void gfx_thin_seg(float x0, float y0, float x1, float y1, float w, rgb_t c, int 
                   float on, float off, float phase)
 {
     thin_impl(cur(), x0, y0, x1, y1, w, c, a256, on, off, phase, NULL, NULL);
+}
+
+gfx_ctx_t *gfx_ctx_new(uint16_t *fb, int y0, int y1)
+{
+    gfx_ctx_t *g = heap_caps_calloc(1, sizeof *g, MALLOC_CAP_SPIRAM);
+    if (g) { g->fb = fb; g->ylo = y0; g->yhi = y1; }
+    return g;
+}
+
+void gfx_ctx_target(gfx_ctx_t *g, uint16_t *fb) { g->fb = fb; }
+
+void gfx_thin_seg_on(gfx_ctx_t *g, float x0, float y0, float x1, float y1, float w, rgb_t c, int a256,
+                     float on, float off, float phase)
+{
+    thin_impl(g, x0, y0, x1, y1, w, c, a256, on, off, phase, NULL, NULL);
 }
 
 // ---------- thick strokes ----------
@@ -296,13 +346,35 @@ void gfx_line(float x0, float y0, float x1, float y1, float w, rgb_t c, float a,
     s.y1 = imin(s.y1, g->yhi - 1);
     uint16_t *fb = g->fb;
     float a256 = a * 256.0f;
+    // Along a row the signed distance from the centre line (d) and the position along it (t)
+    // change by constant steps: Q16 integers (a row of 700 px drifts < 0.01 px). Where the
+    // pixel is clear of the ends (t in [0.5, len - 0.5]) the coverage is the box filter
+    // band(|d|, hw) in integers; near the ends (caps) the exact float seg_cov.
+    const float Q = 65536.0f;
+    const int32_t hwq = (int32_t)(s.hw * Q), rq = (int32_t)(s.reach * Q);
+    const int32_t lo_q = 32768, hi_q = s.len < 16000 ? (int32_t)((s.len - 0.5f) * Q) : INT32_MAX;
+    const int32_t dd = (int32_t)lrintf(s.uy * Q), dt = (int32_t)lrintf(s.ux * Q);
+    const int a8 = (int)(a256 + 0.5f);
     for (int y = s.y0; y <= s.y1; y++) {
         int xa, xb;
         if (!seg_row(&s, y, &xa, &xb)) continue;
         uint16_t *row = fb + y * GFX_W;
-        for (int x = xa; x <= xb; x++) {
-            float cov = seg_cov(&s, x + 0.5f, y + 0.5f);
-            if (cov > 0) blend256(row + x, c, (int)(cov * a256 + 0.5f));
+        const float px = xa + 0.5f - s.ax, py = y + 0.5f - s.ay;
+        int32_t d = (int32_t)((px * s.uy - py * s.ux) * Q), t = (int32_t)((px * s.ux + py * s.uy) * Q);
+        for (int x = xa; x <= xb; x++, d += dd, t += dt) {
+            const int32_t ad = d < 0 ? -d : d;
+            if (ad > rq) continue;
+            if (t >= lo_q && t <= hi_q) {
+                // band: min(d + 0.5, hw) - max(d - 0.5, -hw), clamped to [0, 1]
+                int32_t up = ad + 32768 < hwq ? ad + 32768 : hwq, dn = ad - 32768 > -hwq ? ad - 32768 : -hwq;
+                int32_t cv = up - dn;
+                if (cv <= 0) continue;
+                if (cv > 65536) cv = 65536;
+                blend256(row + x, c, (cv * a8 + 32768) >> 16);
+            } else {
+                float cov = seg_cov(&s, x + 0.5f, y + 0.5f);
+                if (cov > 0) blend256(row + x, c, (int)(cov * a256 + 0.5f));
+            }
         }
     }
 }
@@ -563,11 +635,46 @@ static int next_cp(const char **s)
     return cp;
 }
 
-static const gfx_glyph_t *find_glyph(const gfx_font_t *f, int cp)
+static const gfx_glyph_t *find_glyph_slow(const gfx_font_t *f, int cp)
 {
     for (int i = 0; i < f->n; i++)
         if (f->glyphs[i].cp == cp) return &f->glyphs[i];
     return NULL;
+}
+
+static const glyph_index_t *font_index(const gfx_font_t *f)
+{
+    if (!glyph_index) return NULL;
+    for (int k = 0; k < GLYPH_FONTS; k++) {
+        const gfx_font_t *kf = glyph_index[k].f;
+        if (kf == f) return &glyph_index[k];
+        if (!kf) break;
+    }
+    const glyph_index_t *r = NULL;
+    portENTER_CRITICAL(&glyph_mux);
+    for (int k = 0; k < GLYPH_FONTS && !r; k++) {
+        glyph_index_t *e = &glyph_index[k];
+        if (e->f == f) r = e;
+        else if (!e->f) {
+            memset(e->idx, 255, sizeof e->idx);
+            for (int i = 0; i < f->n && i < 255; i++)
+                if (f->glyphs[i].cp < 128) e->idx[f->glyphs[i].cp] = i;
+            __sync_synchronize();
+            e->f = f;
+            r = e;
+        }
+    }
+    portEXIT_CRITICAL(&glyph_mux);
+    return r;
+}
+
+static const gfx_glyph_t *find_glyph(const gfx_font_t *f, int cp)
+{
+    if (cp < 128) {
+        const glyph_index_t *e = font_index(f);
+        if (e) return e->idx[cp] == 255 ? NULL : &f->glyphs[e->idx[cp]];
+    }
+    return find_glyph_slow(f, cp);
 }
 
 float gfx_text_width(const gfx_font_t *f, const char *utf8, float spacing)

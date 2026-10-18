@@ -57,6 +57,13 @@ void gfx_thin_line(float x0, float y0, float x1, float y1, float w, rgb_t c, flo
 // phase at the start; the caller has already checked the segment reaches this core's rows.
 void gfx_thin_seg(float x0, float y0, float x1, float y1, float w, rgb_t c, int a256,
                   float on, float off, float phase);
+// A drawing context of its own (for a task drawing outside the per-core frame strips, which
+// may be preempted by them), rows y0 <= y < y1 of fb; and gfx_thin_seg into it.
+typedef struct gfx_ctx gfx_ctx_t;
+gfx_ctx_t *gfx_ctx_new(uint16_t *fb, int y0, int y1);
+void gfx_ctx_target(gfx_ctx_t *g, uint16_t *fb);
+void gfx_thin_seg_on(gfx_ctx_t *g, float x0, float y0, float x1, float y1, float w, rgb_t c, int a256,
+                     float on, float off, float phase);
 
 // Thick stroke with exact coverage (butt or round caps), blended on its own like
 // one canvas stroke() per segment.
