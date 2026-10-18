@@ -16,6 +16,16 @@
 #include "orbit.h"
 #include "generated/elements.h"
 #include "net_secret.h"
+#include "esp_heap_caps.h"
+
+// Known networks from net_secret.h (older single-network files still work).
+typedef struct { const char *ssid, *pass; } known_net_t;
+#ifdef NET_WIFI_NETWORKS
+static const known_net_t KNOWN[] = NET_WIFI_NETWORKS;
+#else
+static const known_net_t KNOWN[] = {{NET_WIFI_SSID, NET_WIFI_PASS}};
+#endif
+#define N_KNOWN (int)(sizeof KNOWN / sizeof KNOWN[0])
 
 static const char *TAG = "net";
 
@@ -38,9 +48,8 @@ bool net_busy(void) { return busy; }
 
 static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    // (STA_START: nothing; net_sync picks the network first, then connects.)
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         if (retries < 5 && busy) { retries++; esp_wifi_connect(); }
         else xEventGroupSetBits(wifi_events, FAIL_BIT);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -67,9 +76,9 @@ void net_init(void)
     ESP_LOGI(TAG, "network ready (Wi-Fi driver started on first sync); host name \"%s\"", NET_HOSTNAME);
 }
 
-// Start the radio and begin connecting. The driver is initialised once, on the first sync (so no
-// Wi-Fi RAM is held at boot), and then kept initialised (repeated init/deinit is not reliable);
-// later syncs only start and stop the radio.
+// Start the radio. The driver is initialised once, on the first sync (so no Wi-Fi RAM is held
+// at boot), and then kept initialised (repeated init/deinit is not reliable); later syncs only
+// start and stop the radio.
 static bool wifi_started_once;
 static bool wifi_up(void)
 {
@@ -78,15 +87,46 @@ static bool wifi_up(void)
         if (esp_wifi_init(&cfg) != ESP_OK) return false;
         esp_wifi_set_storage(WIFI_STORAGE_RAM);                // keep credentials out of flash
         esp_wifi_set_mode(WIFI_MODE_STA);                      // station only, never an access point
-        wifi_config_t wc = {0};
-        strlcpy((char *)wc.sta.ssid, NET_WIFI_SSID, sizeof wc.sta.ssid);
-        strlcpy((char *)wc.sta.password, NET_WIFI_PASS, sizeof wc.sta.password);
-        wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-        wc.sta.pmf_cfg.capable = true;
-        esp_wifi_set_config(WIFI_IF_STA, &wc);
         wifi_started_once = true;
     }
-    return esp_wifi_start() == ESP_OK;   // STA_START event -> esp_wifi_connect()
+    return esp_wifi_start() == ESP_OK;
+}
+
+// Which known network is in range: a passive scan (the radio only listens, so the names of
+// networks that are not here are never broadcast). Returns the first match in order of
+// preference, or -1.
+static int pick_network(void)
+{
+    if (N_KNOWN == 1) return 0;   // one network: nothing to choose
+    wifi_scan_config_t sc = {
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_PASSIVE,
+        .scan_time.passive = 150,   // ms per channel
+    };
+    if (esp_wifi_scan_start(&sc, true) != ESP_OK) return -1;
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n > 32) n = 32;
+    wifi_ap_record_t *aps = heap_caps_calloc(n ? n : 1, sizeof *aps, MALLOC_CAP_SPIRAM);
+    if (!aps) { esp_wifi_clear_ap_list(); return -1; }
+    esp_wifi_scan_get_ap_records(&n, aps);
+    esp_wifi_clear_ap_list();
+    int pick = -1;
+    for (int k = 0; k < N_KNOWN && pick < 0; k++)
+        for (int i = 0; i < n; i++)
+            if (strcmp((const char *)aps[i].ssid, KNOWN[k].ssid) == 0) { pick = k; break; }
+    free(aps);
+    return pick;
+}
+
+static bool wifi_join(int k)
+{
+    wifi_config_t wc = {0};
+    strlcpy((char *)wc.sta.ssid, KNOWN[k].ssid, sizeof wc.sta.ssid);
+    strlcpy((char *)wc.sta.password, KNOWN[k].pass, sizeof wc.sta.password);
+    wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wc.sta.pmf_cfg.capable = true;
+    return esp_wifi_set_config(WIFI_IF_STA, &wc) == ESP_OK && esp_wifi_connect() == ESP_OK;
 }
 
 // Stop the radio (no connection held between syncs); the driver stays initialised.
@@ -249,6 +289,14 @@ bool net_sync(net_sync_t what)
     xEventGroupClearBits(wifi_events, CONNECTED_BIT | FAIL_BIT);
     ESP_LOGI(TAG, "connecting to update%s%s", what.time ? " time" : "", what.elements ? " elements" : "");
     if (!wifi_up()) { busy = false; ESP_LOGW(TAG, "Wi-Fi driver could not start"); return false; }
+    int k = pick_network();
+    if (k < 0 || !wifi_join(k)) {
+        ESP_LOGW(TAG, "no known network in range");
+        wifi_down();
+        busy = false;
+        return false;
+    }
+    ESP_LOGI(TAG, "joining known network %d of %d", k + 1, N_KNOWN);
 
     EventBits_t bits = xEventGroupWaitBits(wifi_events, CONNECTED_BIT | FAIL_BIT, pdFALSE, pdFALSE,
                                            pdMS_TO_TICKS(20000));
