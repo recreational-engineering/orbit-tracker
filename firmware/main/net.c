@@ -17,6 +17,7 @@
 #include "generated/elements.h"
 #include "net_secret.h"
 #include "esp_heap_caps.h"
+#include "nvs.h"
 
 // Known networks from net_secret.h (older single-network files still work).
 typedef struct { const char *ssid, *pass; } known_net_t;
@@ -35,6 +36,13 @@ static const char *TAG = "net";
 // A commonplace browser User-Agent, so the request carries nothing that identifies the device.
 #define HTTP_UA "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
                 "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+// CelesTrak publishes new elements a few times a day and blocks clients that ask more often, so
+// the GET is skipped when the last successful one is more recent than this (reboots and the `N`
+// command included). The time of that fetch is kept in NVS so it survives a reboot.
+#define ELEMENTS_MIN_AGE_S (20 * 3600)
+#define FETCH_NVS_NS  "orbit"
+#define FETCH_NVS_KEY "omm_at"
 
 #define CONNECTED_BIT BIT0
 #define FAIL_BIT      BIT1
@@ -153,7 +161,7 @@ static bool sync_time(void)
     return ok;
 }
 
-// ---------- element refresh (HTTPS GET to CelesTrak) ----------
+// ---------- element refresh (HTTP GET to CelesTrak, at most once per ELEMENTS_MIN_AGE_S) ----------
 typedef struct { char *buf; int len, cap; } body_t;
 
 static esp_err_t on_http(esp_http_client_event_t *e)
@@ -249,8 +257,41 @@ static bool parse_and_apply(const char *json)
     return ok;
 }
 
+static int64_t last_fetch(void)
+{
+    int64_t t = 0;
+    nvs_handle_t h;
+    if (nvs_open(FETCH_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_i64(h, FETCH_NVS_KEY, &t);
+        nvs_close(h);
+    }
+    return t;
+}
+
+static void save_fetch(int64_t t)
+{
+    nvs_handle_t h;
+    if (nvs_open(FETCH_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i64(h, FETCH_NVS_KEY, t);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// True when the last successful fetch is recent enough to skip this one. With an unset clock
+// (time sync failed, before 2020) or a fetch time in the future, the age is unknown: fetch.
+static bool elements_fresh(void)
+{
+    int64_t now = time(NULL), last = last_fetch();
+    if (now < 1577836800 || last <= 0 || last > now) return false;
+    if (now - last >= ELEMENTS_MIN_AGE_S) return false;
+    ESP_LOGI(TAG, "elements: fetched %lld min ago, next fetch in %lld min",
+             (long long)(now - last) / 60, (long long)(ELEMENTS_MIN_AGE_S - (now - last)) / 60);
+    return true;
+}
+
 static bool refresh_elements(void)
 {
+    if (elements_fresh()) return true;
     // Fetched over plain HTTP: the response is public orbital data and the request reveals only
     // the (public) NORAD id, which TLS would expose via SNI anyway. TLS to this host does not
     // complete over the Wi-Fi co-processor link, so HTTP is what works here.
@@ -271,6 +312,7 @@ static bool refresh_elements(void)
     if (err == ESP_OK) {
         int code = esp_http_client_get_status_code(cli);
         if (code == 200 && body.buf) ok = parse_and_apply(body.buf);
+        if (ok) save_fetch(time(NULL));
         else ESP_LOGW(TAG, "elements: HTTP %d", code);
     } else {
         ESP_LOGW(TAG, "elements: request failed: %s", esp_err_to_name(err));
