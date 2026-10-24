@@ -1,0 +1,79 @@
+# Publishes web/ to GitHub Pages.
+#
+# The static site has no /api/gp proxy, so the element sets of the objects below are
+# fetched from CelesTrak here and published as gp/<catnr>.json (other objects are fetched
+# by the browser straight from CelesTrak). The schedule keeps them fresh; CelesTrak updates
+# its sets a few times a day and asks not to be polled faster than that.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths: ['web/**', '.github/workflows/pages.yml']
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CATNRS: '100614 25544'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Assemble site
+        run: |
+          mkdir _site
+          cp -R web/. _site/
+          touch _site/.nojekyll
+          assets=$(find web/vendor web/tiles -type f -print0 | sort -z | xargs -0 sha1sum | sha1sum | cut -c1-12)
+          sed -i "s/__BUILD__/${GITHUB_SHA::12}-${GITHUB_RUN_ID}/; s/__ASSETS__/${assets}/" _site/sw.js
+
+      - name: Fetch element sets
+        env:
+          SITE: ${{ steps.pages.outputs.base_url }}
+        run: |
+          mkdir -p _site/gp
+          for n in $CATNRS; do
+            out=_site/gp/$n.json
+            if curl -sfL -m 30 --retry 3 --retry-delay 10 -A 'orbit-tracker (github pages)' \
+                 "https://celestrak.org/NORAD/elements/gp.php?CATNR=$n&FORMAT=JSON" -o "$out" \
+               && jq -e 'type == "array" and length > 0' "$out" > /dev/null; then
+              echo "$n: $(jq -r '.[0].EPOCH' "$out")"
+            # CelesTrak down: keep the set that is live now rather than publishing none.
+            elif curl -sfL -m 30 "$SITE/gp/$n.json" -o "$out" \
+               && jq -e 'type == "array" and length > 0' "$out" > /dev/null; then
+              echo "::warning::$n: CelesTrak failed, kept the published set"
+            else
+              rm -f "$out"
+              echo "::warning::$n: no element set (the browser will ask CelesTrak itself)"
+            fi
+          done
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

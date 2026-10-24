@@ -13,6 +13,14 @@ the size of the display (480×480 or 720×720).
 Libraries and map data are vendored in `web/vendor/`, so only the element
 fetch needs internet.
 
+Hosted build: https://recreational-engineering.github.io/orbit-tracker/ —
+`.github/workflows/pages.yml` publishes `web/` on every push to `main` that
+touches it and every 6 h. That run fetches the element sets listed in
+`CATNRS` from CelesTrak into `gp/<catnr>.json` (keeping the published copy
+if CelesTrak fails); other NORAD IDs are fetched by the browser from
+CelesTrak directly. `web/sw.js` caches the app, vendor data and viewed
+tiles, so reloads are instant and the page works offline.
+
 ## GUI behaviour (reference for the hardware port)
 
 The web prototype is the spec for the firmware. Everything is drawn in

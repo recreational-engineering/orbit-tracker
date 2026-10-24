@@ -479,15 +479,39 @@
     return globeBuf;
   }
 
+  // Element sources, first that answers wins: the local dev server's CelesTrak proxy; on the
+  // static site (GitHub Pages) the element sets baked in by the deploy workflow, then
+  // CelesTrak directly for any other object. The last good set is kept in localStorage so a
+  // reload while offline or while CelesTrak is down still shows the object.
+  const LOCAL_DEV = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+  const gpSources = (catnr) => (LOCAL_DEV ? [`/api/gp?catnr=${catnr}`] : [
+    `gp/${catnr}.json`,
+    `https://celestrak.org/NORAD/elements/gp.php?CATNR=${catnr}&FORMAT=JSON`,
+  ]);
+
+  async function fetchGp(catnr) {
+    let err = new Error('No element set found');
+    for (const url of gpSources(catnr)) {
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+        const data = await res.json();   // CelesTrak answers errors in plain text
+        if (res.ok && Array.isArray(data) && data.length) return data;
+        if (data.error) err = new Error(data.error);
+      } catch (e) { err = e; }
+    }
+    try {
+      const saved = JSON.parse(localStorage.getItem(`gp_${catnr}`));
+      if (Array.isArray(saved) && saved.length) return saved;
+    } catch (e) { /* storage unavailable */ }
+    throw err;
+  }
+
   async function loadSatellite(catnr) {
     ui.status.className = 'status';
     ui.status.textContent = `Fetching elements for ${catnr}…`;
     try {
-      const res = await fetch(`/api/gp?catnr=${catnr}`);
-      const data = await res.json();
-      if (!res.ok || !Array.isArray(data) || !data.length) {
-        throw new Error(data.error || 'No element set found');
-      }
+      const data = await fetchGp(catnr);
+      try { localStorage.setItem(`gp_${catnr}`, JSON.stringify(data)); } catch (e) { /* ignore */ }
       state.omm = data[0];
       // OMM/JSON instead of TLE: TLE lines cannot hold 6-digit catalog numbers.
       state.satrec = satellite.json2satrec(state.omm);
