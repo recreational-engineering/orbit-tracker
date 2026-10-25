@@ -524,6 +524,8 @@
       state.sat = null;
       state.now = state.ahead = null;
       state.track = [];
+      state.marks = [];
+      state.nextPass = null;
       ui.status.className = 'status error';
       ui.status.textContent = `Could not load ${catnr}: ${e.message}`;
     }
@@ -1977,6 +1979,8 @@
   // for the ESP32), the ±1 h track once a second.
   let lastTrack = 0, lastNow = 0;
   function frame(ts) {
+    // Scheduled first so an exception in one frame cannot stop the loop for good.
+    requestAnimationFrame(frame);
     if (ts - lastTrack > 1000) { lastTrack = ts; updateTrack(); }
     if (ts - lastNow > 100) { lastNow = ts; updateNow(); state.dirty = true; }
     if (state.mode === 'spin') state.dirty = true;   // continuous rotation
@@ -1991,7 +1995,6 @@
       draw();
       perf.total = performance.now() - t0;
     }
-    requestAnimationFrame(frame);
   }
 
   layout();
