@@ -2208,7 +2208,9 @@
   let drag = null;
   canvas.addEventListener('pointerdown', (e) => {
     canvas.setPointerCapture(e.pointerId);
-    drag = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: false };
+    // CSS scales the canvas to fit the window: client px → canvas px.
+    const scale = canvas.width / (canvas.getBoundingClientRect().width || canvas.width);
+    drag = { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: false, scale };
     state.vel = [0, 0];
   });
   canvas.addEventListener('pointermove', (e) => {
@@ -2216,7 +2218,7 @@
     if (!drag.moved && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < TAP_SLOP_PX) return;
     drag.moved = true;
     canvas.classList.add('dragging');
-    const k = DEG / discRadius();   // one disc radius ≈ 57°
+    const k = DEG / discRadius() * drag.scale;   // one disc radius ≈ 57°
     const dx = (e.clientX - drag.x) * k;
     const dy = (e.clientY - drag.y) * k;
     drag.x = e.clientX; drag.y = e.clientY;

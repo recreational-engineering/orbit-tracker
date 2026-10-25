@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Orbit Tracker Prototype</title>
-  <meta name="theme-color" content="#16181a">
+  <title>Orbit Tracker Webapp</title>
+  <meta name="theme-color" content="#0a0a0a">
   <link rel="stylesheet" href="style.css">
   <!-- Fetched by app.js once it runs; start the downloads with the HTML instead. -->
   <link rel="preload" href="vendor/land-50m.json" as="fetch" crossorigin>
@@ -19,69 +19,87 @@
   <script src="app.js" defer></script>
 </head>
 <body>
-  <main class="layout">
-    <section class="device-wrap">
-      <!-- Emulated round 4" display. The canvas is the exact pixel buffer the ESP32 would render. -->
-      <div class="bezel">
-        <div class="bezel-inner">
-          <canvas id="display" width="480" height="480"></canvas>
-        </div>
+  <main class="app">
+    <aside class="side" id="side">
+      <header class="bar">
+        <h1>ORBIT TRACKER WEBAPP</h1>
+        <button type="button" class="params-toggle" id="paramsToggle" aria-expanded="false" aria-controls="params">Params</button>
+      </header>
+
+      <div class="params" id="params">
+        <section class="sect">
+          <h2>Target</h2>
+          <div class="prop">
+            <label for="norad">norad_id</label>
+            <span class="ctl row">
+              <input id="norad" type="number" value="100614" min="1">
+              <button id="load" class="btn">Load</button>
+            </span>
+          </div>
+          <div id="status" class="status">Loading…</div>
+        </section>
+
+        <section class="sect">
+          <h2>View mode <kbd>M</kbd></h2>
+          <div class="segmented">
+            <button data-mode="spin" title="Earth spin">Spin</button>
+            <button data-mode="home" title="Ground reference">Ground</button>
+            <button data-mode="orbit" title="Satellite reference">Sat</button>
+            <button data-mode="pilot" title="Pilot reference">Pilot</button>
+            <button data-mode="flat" title="Flat earth">Flat</button>
+          </div>
+        </section>
+
+        <section class="sect">
+          <h2>Parameters</h2>
+          <div class="prop stack">
+            <label for="time">time_offset <output id="timeOut">now</output></label>
+            <input id="time" type="range" min="-720" max="720" step="1" value="0">
+          </div>
+          <div class="prop stack">
+            <label for="exag">alt_exaggeration <output id="exagOut">1.0×</output></label>
+            <input id="exag" type="range" min="1" max="5" step="0.1" value="1">
+          </div>
+          <div class="prop">
+            <label for="size">display_size</label>
+            <select id="size" class="ctl">
+              <option value="480">480 × 480</option>
+              <option value="720">720 × 720</option>
+            </select>
+          </div>
+        </section>
+
+        <section class="sect">
+          <h2>Layers</h2>
+          <label class="prop switch"><span>graticule</span><input type="checkbox" id="graticule" checked></label>
+          <label class="prop switch"><span>borders</span><input type="checkbox" id="borders" checked></label>
+          <label class="prop switch"><span>reticle</span><input type="checkbox" id="reticle" checked></label>
+          <label class="prop switch"><span>night_side</span><input type="checkbox" id="night" checked></label>
+        </section>
+
+        <!-- Written by app.js; not shown. -->
+        <dl id="readout" hidden></dl>
       </div>
-      <div class="plate">ОРБИТА · ORBIT TRACKER</div>
-    </section>
-
-    <aside class="panel">
-      <h1>Orbit tracker <span>prototype</span></h1>
-
-      <div class="group">
-        <label>NORAD ID
-          <span class="row">
-            <input id="norad" type="number" value="100614" min="1">
-            <button id="load">Load</button>
-          </span>
-        </label>
-        <div id="status" class="status">Loading…</div>
-      </div>
-
-      <div class="group">
-        <span class="label">View mode <kbd>M</kbd></span>
-        <div class="segmented">
-          <button data-mode="spin">Earth spin</button>
-          <button data-mode="home">Ground ref.</button>
-          <button data-mode="orbit">Satellite ref.</button>
-          <button data-mode="pilot">Pilot ref.</button>
-          <button data-mode="flat">Flat earth</button>
-        </div>
-      </div>
-
-      <dl class="readout" id="readout"></dl>
-
-      <div class="group">
-        <label>Time offset <output id="timeOut">now</output>
-          <input id="time" type="range" min="-720" max="720" step="1" value="0">
-        </label>
-        <label>Altitude exaggeration <output id="exagOut">1.0×</output>
-          <input id="exag" type="range" min="1" max="5" step="0.1" value="1">
-        </label>
-        <label>Display size
-          <select id="size">
-            <option value="480">480 × 480</option>
-            <option value="720">720 × 720</option>
-          </select>
-        </label>
-      </div>
-
-      <div class="group toggles">
-        <label><input type="checkbox" id="graticule" checked> Graticule</label>
-        <label><input type="checkbox" id="borders" checked> Borders</label>
-        <label><input type="checkbox" id="reticle" checked> Reticle</label>
-        <label><input type="checkbox" id="night" checked> Night side</label>
-      </div>
-
-      <p class="hint"><b>Earth spin:</b> seen from the equator, north up, the Earth turning once per minute with the ground track. <b>Ground reference:</b> Earth fixed, Munich centred, north up; the object passes by. <b>Satellite reference:</b> object fixed at the centre flying up; the orbit is a vertical line and the Earth turns below. <b>Pilot reference:</b> looking prograde from the object with a fighter-style HUD. <b>Flat earth:</b> azimuthal equidistant map around the north pole. Tap the bottom readout on the display for the view menu; tap the time to re-centre. Drag to look around; the view glides back after 4 s.</p>
     </aside>
+
+    <section class="stage">
+      <!-- Emulated round 4" display. The canvas is the exact pixel buffer the ESP32 would render;
+           CSS scales it to the largest circle that fits the stage. -->
+      <canvas id="display" width="480" height="480"></canvas>
+    </section>
   </main>
 
+  <script>
+    // Compact layout: the parameter strip folds away above the screen.
+    (() => {
+      const btn = document.getElementById('paramsToggle');
+      const side = document.getElementById('side');
+      btn.addEventListener('click', () => {
+        const open = side.classList.toggle('open');
+        btn.setAttribute('aria-expanded', String(open));
+      });
+    })();
+  </script>
   <script>
     // Offline cache and instant reloads on the static site; not on the local dev server.
     if ('serviceWorker' in navigator && !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)) {
