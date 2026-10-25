@@ -50,7 +50,7 @@ jobs:
           mkdir -p _site/gp
           for n in $CATNRS; do
             out=_site/gp/$n.json
-            if curl -sfL -m 30 --retry 3 --retry-delay 10 -A 'orbit-tracker (github pages)' \
+            if curl -sfL -m 30 -A 'orbit-tracker (GitHub Pages build; +https://github.com/recreational-engineering/orbit-tracker)' \
                  "https://celestrak.org/NORAD/elements/gp.php?CATNR=$n&FORMAT=JSON" -o "$out" \
                && jq -e 'type == "array" and length > 0' "$out" > /dev/null; then
               echo "$n: $(jq -r '.[0].EPOCH' "$out")"

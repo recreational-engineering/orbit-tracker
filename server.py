@@ -5,7 +5,9 @@ Serves ./web as static files and proxies orbital elements from CelesTrak:
     GET /api/gp?catnr=100614   -> CelesTrak OMM JSON (cached on disk for 2 h)
 
 CelesTrak asks clients not to re-download the same element set more often
-than its update cadence, so responses are cached in ./cache.
+than its update cadence and firewalls those that keep asking after errors, so
+responses are cached in ./cache and CelesTrak is asked at most once per 2 h
+per object, whether or not the last attempt succeeded.
 """
 import http.server
 import json
@@ -23,11 +25,12 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(ROOT, "web")
 CACHE_DIR = os.path.join(ROOT, "cache")
 CACHE_TTL_S = 2 * 3600
+USER_AGENT = "orbit-tracker/1.0 (dev server; +https://github.com/recreational-engineering/orbit-tracker)"
 CELESTRAK_URL = "https://celestrak.org/NORAD/elements/gp.php?CATNR={}&FORMAT=JSON"
 
 
 def download(url: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "orbit-tracker-prototype"})
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             return resp.read()
@@ -36,7 +39,7 @@ def download(url: str) -> bytes:
         if not isinstance(e.reason, ssl.SSLError):
             raise
         return subprocess.run(
-            ["curl", "-sfL", "-m", "20", "-A", "orbit-tracker-prototype", url],
+            ["curl", "-sfL", "-m", "20", "-A", USER_AGENT, url],
             check=True, capture_output=True,
         ).stdout
 
@@ -44,9 +47,14 @@ def download(url: str) -> bytes:
 def fetch_gp(catnr: int) -> bytes:
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, f"gp_{catnr}.json")
-    if os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_TTL_S:
-        with open(path, "rb") as f:
-            return f.read()
+    attempt = os.path.join(CACHE_DIR, f"gp_{catnr}.attempt")
+    if os.path.exists(attempt) and time.time() - os.path.getmtime(attempt) < CACHE_TTL_S:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return f.read()
+        raise RuntimeError("CelesTrak asked less than 2 h ago without success; not asking again yet")
+    with open(attempt, "w"):
+        pass   # mtime = time of this attempt, kept across server restarts
     try:
         data = download(CELESTRAK_URL.format(catnr))
         json.loads(data)  # CelesTrak returns plain text on errors

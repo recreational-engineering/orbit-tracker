@@ -33,13 +33,14 @@ static const char *TAG = "net";
 // The one remote host the device ever contacts for elements. Time comes from NTP.
 #define CELESTRAK_HOST "celestrak.org"
 #define NTP_SERVER     "pool.ntp.org"
-// A commonplace browser User-Agent, so the request carries nothing that identifies the device.
-#define HTTP_UA "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+// Names the project, so CelesTrak can tell what is asking and whom to contact about it.
+#define HTTP_UA "orbit-tracker/1.0 (ESP32-P4 desk display; " \
+                "+https://github.com/recreational-engineering/orbit-tracker)"
 
-// CelesTrak publishes new elements a few times a day and blocks clients that ask more often, so
-// the GET is skipped when the last successful one is more recent than this (reboots and the `N`
-// command included). The time of that fetch is kept in NVS so it survives a reboot.
+// CelesTrak publishes new elements a few times a day and firewalls clients that ask more often
+// or keep asking after an error, so the GET is skipped while the last attempt (successful or
+// not) is more recent than this, reboots and the `N` command included. The attempt time is
+// stored in NVS before the request goes out, so it survives a reboot.
 #define ELEMENTS_MIN_AGE_S (20 * 3600)
 #define FETCH_NVS_NS  "orbit"
 #define FETCH_NVS_KEY "omm_at"
@@ -161,7 +162,7 @@ static bool sync_time(void)
     return ok;
 }
 
-// ---------- element refresh (HTTP GET to CelesTrak, at most once per ELEMENTS_MIN_AGE_S) ----------
+// ---------- element refresh (HTTP GET to CelesTrak, at most one attempt per ELEMENTS_MIN_AGE_S) ----------
 typedef struct { char *buf; int len, cap; } body_t;
 
 static esp_err_t on_http(esp_http_client_event_t *e)
@@ -257,7 +258,7 @@ static bool parse_and_apply(const char *json)
     return ok;
 }
 
-static int64_t last_fetch(void)
+static int64_t last_attempt(void)
 {
     int64_t t = 0;
     nvs_handle_t h;
@@ -268,7 +269,7 @@ static int64_t last_fetch(void)
     return t;
 }
 
-static void save_fetch(int64_t t)
+static void save_attempt(int64_t t)
 {
     nvs_handle_t h;
     if (nvs_open(FETCH_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
@@ -277,21 +278,26 @@ static void save_fetch(int64_t t)
     nvs_close(h);
 }
 
-// True when the last successful fetch is recent enough to skip this one. With an unset clock
-// (time sync failed, before 2020) or a fetch time in the future, the age is unknown: fetch.
-static bool elements_fresh(void)
+// True when the GET may go out now. With an unset clock (time sync failed, before 2020) the age
+// of the last attempt is unknown, so nothing is fetched: a device stuck without NTP must not ask
+// on every boot. A stored time in the future (clock was wrong then) does not block.
+static bool may_fetch(void)
 {
-    int64_t now = time(NULL), last = last_fetch();
-    if (now < 1577836800 || last <= 0 || last > now) return false;
-    if (now - last >= ELEMENTS_MIN_AGE_S) return false;
-    ESP_LOGI(TAG, "elements: fetched %lld min ago, next fetch in %lld min",
+    int64_t now = time(NULL), last = last_attempt();
+    if (now < 1577836800) {
+        ESP_LOGW(TAG, "elements: clock not set, fetch skipped");
+        return false;
+    }
+    if (last <= 0 || last > now || now - last >= ELEMENTS_MIN_AGE_S) return true;
+    ESP_LOGI(TAG, "elements: last attempt %lld min ago, next in %lld min",
              (long long)(now - last) / 60, (long long)(ELEMENTS_MIN_AGE_S - (now - last)) / 60);
-    return true;
+    return false;
 }
 
 static bool refresh_elements(void)
 {
-    if (elements_fresh()) return true;
+    if (!may_fetch()) return false;
+    save_attempt(time(NULL));
     // Fetched over plain HTTP: the response is public orbital data and the request reveals only
     // the (public) NORAD id, which TLS would expose via SNI anyway. TLS to this host does not
     // complete over the Wi-Fi co-processor link, so HTTP is what works here.
@@ -312,10 +318,10 @@ static bool refresh_elements(void)
     if (err == ESP_OK) {
         int code = esp_http_client_get_status_code(cli);
         if (code == 200 && body.buf) ok = parse_and_apply(body.buf);
-        if (ok) save_fetch(time(NULL));
-        else ESP_LOGW(TAG, "elements: HTTP %d", code);
+        if (!ok) ESP_LOGW(TAG, "elements: HTTP %d, next attempt in %d h", code, ELEMENTS_MIN_AGE_S / 3600);
     } else {
-        ESP_LOGW(TAG, "elements: request failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "elements: request failed: %s, next attempt in %d h", esp_err_to_name(err),
+                 ELEMENTS_MIN_AGE_S / 3600);
     }
     esp_http_client_cleanup(cli);
     free(body.buf);

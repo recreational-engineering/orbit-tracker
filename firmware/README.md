@@ -73,10 +73,12 @@ The device joins only to read two things and then takes the radio back down:
   to NVS so they survive a reboot (loaded at the next boot before the first sync).
 
 It syncs once at boot and then once a day at 00:00 UTC (and on the `N` command). Between syncs
-the radio is off. The CelesTrak GET is skipped when the last successful one is less than 20 h old
-(its time is kept in NVS, so reboots and `N` count too): CelesTrak blocks clients that ask more
-often. NTP runs on every sync. It joins as a station only (never an access point), presents one nondescript
-DHCP host name (an office-printer style name), and makes no other connection — there is no
+the radio is off. The CelesTrak GET is skipped when the last attempt, successful or not, is less
+than 20 h old (its time is written to NVS before the request, so reboots and `N` count too), and
+whenever the clock is not set: CelesTrak firewalls clients that ask more often or keep asking
+after an error. The request's User-Agent names this project and its repository so CelesTrak can
+see what is asking. NTP runs on every sync. It joins as a station only (never an access point),
+presents one nondescript DHCP host name (an office-printer style name), and makes no other connection — there is no
 server, no discovery service, and no path that sends device data anywhere.
 
 Credentials and the host name live in `main/net_secret.h` (git-ignored; copy
