@@ -49,14 +49,14 @@
   const ui = {
     norad: $('norad'), load: $('load'), status: $('status'), readout: $('readout'),
     time: $('time'), timeOut: $('timeOut'), exag: $('exag'), exagOut: $('exagOut'),
-    size: $('size'), modes: document.querySelectorAll('[data-mode]'), graticule: $('graticule'),
+    graticule: $('graticule'),
     borders: $('borders'), reticle: $('reticle'), night: $('night'),
   };
 
   // ---------- state ----------
   const state = {
-    size: 480,
-    mode: 'orbit',            // spin | home | orbit | pilot | flat (see MODES)
+    size: 720,
+    mode: 'spin',             // spin | home | orbit | pilot | flat (see MODES)
     spinT0: 0,                // Earth-spin view: time the spin started (performance.now ms)
     rotate: [-10, -45, 0],    // d3 rotation [λ, φ, γ]: view centre at (-λ, -φ), γ spins the view
     vel: [0, 0],              // pan inertia (deg / frame)
@@ -2199,7 +2199,6 @@
       if (isPilot()) state.rotate = [0, 0, 0];
       else state.rotate = targetRotation() || (isFlat() ? [0, -90, 0] : state.rotate);
     }
-    for (const b of ui.modes) b.classList.toggle('active', b.dataset.mode === mode);
     state.dirty = true;
   }
 
@@ -2289,8 +2288,6 @@
     ui.exagOut.textContent = Number(ui.exag.value).toFixed(1) + '×';
     state.dirty = true;
   });
-  ui.size.addEventListener('change', () => { state.size = Number(ui.size.value); layout(); });
-  for (const b of ui.modes) b.addEventListener('click', () => setMode(b.dataset.mode));
   window.addEventListener('keydown', (e) => {
     if (e.key === 'm' && e.target === document.body) {
       const order = MODES.map((m) => m.mode);

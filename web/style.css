@@ -87,14 +87,6 @@ h2 {
   color: var(--dim);
 }
 
-kbd {
-  font: 9px/1 var(--mono);
-  color: var(--muted);
-  border: 1px solid var(--line-2);
-  border-radius: 2px;
-  padding: 2px 4px;
-}
-
 .prop {
   display: flex;
   align-items: center;
@@ -128,7 +120,6 @@ input[type=number], select {
   outline: none;
 }
 input[type=number] { flex: 1; width: 0; }
-select.ctl { flex: 0 1 152px; }
 input[type=number]:focus, select:focus { border-color: #4a4a4a; }
 
 button { font: inherit; cursor: pointer; }
@@ -165,24 +156,6 @@ button { font: inherit; cursor: pointer; }
 }
 .status.error { color: var(--error); }
 .status.error::before { background: var(--error); box-shadow: 0 0 6px var(--error); }
-
-/* ---- segmented view mode ---- */
-.segmented { display: flex; background: var(--field); border: 1px solid var(--line); border-radius: 2px; padding: 2px; gap: 2px; }
-.segmented button {
-  flex: 1;
-  min-width: 0;
-  height: 22px;
-  padding: 0 2px;
-  background: transparent;
-  color: var(--dim);
-  border: 0;
-  border-radius: 1px;
-  font: 500 10px/1 var(--mono);
-  letter-spacing: .04em;
-  text-transform: uppercase;
-}
-.segmented button:hover { color: var(--muted); }
-.segmented button.active { background: var(--raised); color: var(--text); box-shadow: inset 0 -1px 0 var(--accent); }
 
 /* ---- range: thin track, square thumb ---- */
 input[type=range] {
