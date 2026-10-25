@@ -96,6 +96,82 @@
   const graticule = d3.geoGraticule10();
   const sphere = { type: 'Sphere' };
 
+  // d3 rotation [λ, φ, γ] (degrees) as a 3×3 matrix on Earth unit vectors; row 0 points at
+  // the viewer (visible side of the globe: > 0), rows 1 / 2 are screen right / up. Cached for
+  // the last rotation, since project3d() runs a few thousand times per frame.
+  let rotKey = [NaN, NaN, NaN], rotM = null;
+  function rotationMatrix(rot) {
+    const g = rot[2] || 0;
+    if (rot[0] === rotKey[0] && rot[1] === rotKey[1] && g === rotKey[2]) return rotM;
+    const l = rot[0] / DEG, p = rot[1] / DEG, gg = g / DEG;
+    const cl = Math.cos(l), sl = Math.sin(l), cp = Math.cos(p), sp = Math.sin(p), cg = Math.cos(gg), sg = Math.sin(gg);
+    rotKey = [rot[0], rot[1], g];
+    rotM = [
+      cl * cp, -sl * cp, -sp,
+      sl * cg - cl * sp * sg, cl * cg + sl * sp * sg, -cp * sg,
+      cl * sp * cg + sl * sg, -sl * sp * cg + cl * sg, cp * cg,
+    ];
+    return rotM;
+  }
+
+  // Borders and graticule on the orthographic globe without d3's per-frame adaptive
+  // resampling and clipping: each line is densified once into unit vectors (steps ≤ 2.5°,
+  // so a straight chord stays within 0.1 px of the great-circle arc even at 720 px, finer
+  // than d3's own 0.7 px resampling), then a frame only rotates the points and cuts the
+  // lines where they cross the horizon.
+  const LINE_STEP = 2.5 / DEG;
+  const unitLineCache = new WeakMap();
+  function unitLines(geom) {
+    let out = unitLineCache.get(geom);
+    if (out) return out;
+    const lines = geom.type === 'LineString' ? [geom.coordinates] : geom.coordinates;   // MultiLineString
+    out = lines.map((line) => {
+      const pts = [];
+      let px = 0, py = 0, pz = 0;
+      line.forEach(([lo, la], i) => {
+        const l = lo / DEG, p = la / DEG;
+        const x = Math.cos(p) * Math.cos(l), y = Math.cos(p) * Math.sin(l), z = Math.sin(p);
+        if (i > 0) {
+          const ang = Math.acos(Math.max(-1, Math.min(1, px * x + py * y + pz * z)));
+          const k = Math.ceil(ang / LINE_STEP);
+          for (let j = 1; j < k; j++) {   // slerp: points along the great circle
+            const a = Math.sin((1 - j / k) * ang) / Math.sin(ang), b = Math.sin(j / k * ang) / Math.sin(ang);
+            pts.push(a * px + b * x, a * py + b * y, a * pz + b * z);
+          }
+        }
+        pts.push(x, y, z);
+        px = x; py = y; pz = z;
+      });
+      return Float64Array.from(pts);
+    });
+    unitLineCache.set(geom, out);
+    return out;
+  }
+  function globeLinePath(geom) {
+    const M = rotationMatrix(projection.rotate()), k = projection.scale(), [tx, ty] = projection.translate();
+    const [m0, m1, m2, m3, m4, m5, m6, m7, m8] = M;
+    for (const L of unitLines(geom)) {
+      let pX = 0, pY = 0, pZ = 0, pVis = false;
+      for (let i = 0; i < L.length; i += 3) {
+        const x = L[i], y = L[i + 1], z = L[i + 2];
+        const X = m0 * x + m1 * y + m2 * z, Y = m3 * x + m4 * y + m5 * z, Z = m6 * x + m7 * y + m8 * z;
+        const vis = X > 0;
+        if (i > 0 && vis !== pVis) {
+          // Horizon crossing between the two points (X = 0 on the great circle).
+          const t = pX / (pX - X), cY = pY + (Y - pY) * t, cZ = pZ + (Z - pZ) * t, n = Math.hypot(cY, cZ) || 1;
+          const hx = tx + k * cY / n, hy = ty - k * cZ / n;
+          if (pVis) ctx.lineTo(hx, hy); else ctx.moveTo(hx, hy);
+        }
+        if (vis) {
+          if (pVis || i > 0) ctx.lineTo(tx + k * Y, ty - k * Z); else ctx.moveTo(tx + k * Y, ty - k * Z);
+        }
+        pX = X; pY = Y; pZ = Z; pVis = vis;
+      }
+    }
+  }
+  // Path of a line geometry in the current projection (adds to the current canvas path).
+  const linePath = (geom) => (projection === ortho ? globeLinePath(geom) : path(geom));
+
   function layout() {
     const s = state.size;
     canvas.width = s;
@@ -173,7 +249,7 @@
       hiCtx.drawImage(img, 0, 0);
       const px = hiCtx.getImageData(0, 0, HI.T, HI.T).data;
       boostTerrain(px);
-      hiTiles.set(key, { px, mask: tileLandMask(key), used: hiFrame });
+      hiTiles.set(key, { col: bakeTile(px, tileLandMask(key)), used: hiFrame });   // see renderPilotPixels()
       if (hiTiles.size > HI.CACHE) {   // evict the least recently used tile
         let oldK = -1, oldU = Infinity;
         for (const [k, t] of hiTiles) if (t.used < oldU) { oldU = t.used; oldK = k; }
@@ -272,11 +348,6 @@
     state.dirty = true;
   }
 
-  const smoothstep = (e0, e1, x) => {
-    const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0)));
-    return t * t * (3 - 2 * t);
-  };
-
   // Land mask: land-50m rasterised once to an equirectangular byte grid (1 = land).
   // Replaces per-frame vector clipping, and its edges give the coastline for free.
   const MASK_W = 2048, MASK_H = 1024;
@@ -294,189 +365,385 @@
     state.dirty = true;
   }
 
-  // Per-pixel inverse orthographic projection onto the globe, one pass into one buffer:
-  // sea / terrain (land mask), coastline (mask edges), night darkening and city lights.
-  let globeBuf = null, globeImg = null;
-  function renderGlobePixels(withNight) {
-    const s = state.size, flat = isFlat(), cam = isPilot() ? state.cam : null;
-    const r = cam ? s / 2 : discRadius();   // pilot view fills the whole round screen
-    const [cx, cy] = projection.translate();
-    if (!globeBuf || globeBuf.width !== s) {
-      globeBuf = document.createElement('canvas');
-      globeBuf.width = globeBuf.height = s;
-      globeImg = globeBuf.getContext('2d').createImageData(s, s);
+  // ---------- per-pixel globe renderer ----------
+  // Inverse projection of every screen pixel onto the Earth, one pass into one buffer: sea /
+  // terrain (land mask), coastline (mask edges), night darkening and city lights.
+  //
+  // Speed (web): everything that does not change from frame to frame is precomputed.
+  //  - surfaceColors(): sea / terrain / lakes / coastline baked into one RGBA word per texel
+  //    of the 2048×1024 grid shared by land mask, terrain and lights (high-res tiles likewise
+  //    on load), so a pixel is one lookup.
+  //  - viewGeometry(): globe and flat views keep the per-pixel inverse projection (texel row,
+  //    longitude before the λ turn, surface normal, lights level of detail) until tilt φ, roll γ
+  //    or the size change. Earth spin and ground view only turn λ, so a frame there is just a
+  //    shift of the texel column and a 3-term dot product for the sun.
+  //  - pilotRays(): the camera-space ray of each pixel, normalised once per display size.
+  //  - Output is written as 32-bit words; the buffer is cleared only when the footprint changes.
+  const TEX_W = 2048, TEX_H = 1024;   // = MASK_W × MASK_H = terrain = lights level 0
+  const TWO_PI = 2 * Math.PI;
+  const packRgb = (R, G, B) => {   // floats → clamped, rounded RGBA word (little endian)
+    R = R >= 255 ? 255 : (R + 0.5) | 0; G = G >= 255 ? 255 : (G + 0.5) | 0; B = B >= 255 ? 255 : (B + 0.5) | 0;
+    return (0xff000000 | (B << 16) | (G << 8) | R) >>> 0;
+  };
+  const [KR, KG, KB] = C.coastRgb;
+  const coastMix = (R, G, B) => packRgb(R * 0.45 + KR * 0.55, G * 0.45 + KG * 0.55, B * 0.45 + KB * 0.55);
+
+  let surface = null;   // {tex, mask, px: Uint32Array TEX_W × TEX_H}
+  function surfaceColors() {
+    const tex = state.tex, mask = state.mask;
+    if (surface && surface.tex === tex && surface.mask === mask) return surface.px;
+    const px = new Uint32Array(TEX_W * TEX_H), [sr, sg, sb] = C.sea, [lr, lg, lb] = C.landRgb;
+    const sea = packRgb(sr, sg, sb), seaCoast = coastMix(sr, sg, sb);
+    const t = tex && tex.w === TEX_W && tex.h === TEX_H ? tex.px : null;
+    if (!mask) px.fill(sea);
+    else {
+      for (let mv = 0; mv < TEX_H; mv++) {
+        for (let mu = 0; mu < TEX_W; mu++) {
+          const mi = mv * TEX_W + mu, land = mask[mi];
+          const coast = land !== mask[mv * TEX_W + ((mu + 1) % TEX_W)] || (mv + 1 < TEX_H && land !== mask[mi + TEX_W]);
+          let R = sr, G = sg, B = sb;
+          if (land) {
+            if (t) { const ti = mi * 4; if (t[ti + 3] !== 0) { R = t[ti]; G = t[ti + 1]; B = t[ti + 2]; } }   // else: lake
+            else { R = lr; G = lg; B = lb; }
+          }
+          px[mi] = R === sr && G === sg && B === sb ? (coast ? seaCoast : sea) : coast ? coastMix(R, G, B) : packRgb(R, G, B);
+        }
+      }
     }
-    const o = globeImg.data;
-    o.fill(0);
-    const tex = state.tex, mask = state.mask, lights = withNight ? state.lights : null;
-    // Sun direction in Earth-fixed coordinates.
-    const [slon, slat] = subsolarPoint(simTime()).map((d) => d / DEG);
-    const sx = Math.cos(slat) * Math.cos(slon), sy = Math.cos(slat) * Math.sin(slon), sz = Math.sin(slat);
-    const lam = state.rotate[0] / DEG, phi = state.rotate[1] / DEG, gam = (state.rotate[2] || 0) / DEG;
-    const cp = Math.cos(phi), sp = Math.sin(phi), cg = Math.cos(gam), sg2 = Math.sin(gam);
-    const cl0 = Math.cos(lam), sl0 = Math.sin(lam);
-    // Pilot camera: ray = f + X·tanH·rt + Y·tanH·u; Earth is a sphere of radius EARTH_R_KM.
-    const tanH = Math.tan(PILOT_HALF_FOV), pixAng = 2 * tanH / s;
-    const gm = cam ? cam.gmst : 0, cgm = Math.cos(gm), sgm = Math.sin(gm);
-    const RE = EARTH_R_KM, cc2 = cam ? cam.c[0] ** 2 + cam.c[1] ** 2 + cam.c[2] ** 2 : 0;
-    const tHorizon = Math.sqrt(Math.max(0, cc2 - RE * RE));
-    const grat = cam && ui.graticule.checked;
-    const hiMaxT = cam ? HI.FOOTPRINT_KM / pixAng : 0;   // use tiles while hitT < this
-    let hiKey = -1, hiTile = null, litKey = -1, litTile = null;
-    // Ground footprint of one screen pixel (km) → lights level of detail.
-    const kmPerPxGlobe = RE / r, kmPerPxFlat = Math.PI * RE / r;
-    const LIGHT_TEXEL_KM = 2 * Math.PI * RE / 2048;   // global lights level 0 (~19.5 km)
-    const mips = state.lightMips;
-    if (cam) hiFrame++;
-    const [sr, sg, sb] = C.sea, [lr, lg, lb] = C.landRgb, [kr, kg, kb] = C.coastRgb;
+    surface = { tex, mask, px };
+    return px;
+  }
+
+  // High-res tile: colour from the raster, land / sea and coastline from the vector mask.
+  function bakeTile(t, m) {
+    const T = HI.T, out = new Uint32Array(T * T), [sr, sg, sb] = C.sea;
+    for (let ty = 0; ty < T; ty++) {
+      for (let tx = 0; tx < T; tx++) {
+        const mi = ty * T + tx, land = m[mi], ti = mi * 4;
+        let R = sr, G = sg, B = sb;
+        if (land && t[ti + 3] !== 0) { R = t[ti]; G = t[ti + 1]; B = t[ti + 2]; }
+        const coast = (tx + 1 < T && m[mi + 1] !== land) || (ty + 1 < T && m[mi + T] !== land);
+        out[mi] = coast ? coastMix(R, G, B) : packRgb(R, G, B);
+      }
+    }
+    return out;
+  }
+
+  // atan2 without the library call: one range reduction to |t| ≤ tan 15°, then the Taylor
+  // series (error < 3e-9 rad, ~1/1000 of a texel of the finest tiles).
+  const SQRT3 = Math.sqrt(3), TAN15 = 2 - SQRT3;
+  function fastAtan2(y, x) {
+    const ax = x < 0 ? -x : x, ay = y < 0 ? -y : y;
+    const swap = ay > ax;
+    if (!swap && ax === 0) return 0;
+    let t = swap ? ax / ay : ay / ax, off = 0;
+    if (t > TAN15) { t = (t * SQRT3 - 1) / (SQRT3 + t); off = Math.PI / 6; }
+    const t2 = t * t;
+    let r = off + t * (1 - t2 * (1 / 3 - t2 * (1 / 5 - t2 * (1 / 7 - t2 * (1 / 9 - t2 / 11)))));
+    if (swap) r = Math.PI / 2 - r;
+    if (x < 0) r = Math.PI - r;
+    return y < 0 ? -r : r;
+  }
+  // Texel row floor(H · min(0.9999, 0.5 − asin(z)/π)) of a point with sin(latitude) = z, without
+  // asin: a guess from a table over z, corrected against the exact row boundaries cos(jπ/H).
+  function rowTable(H) {
+    const Q = 1 << 16, bound = new Float64Array(H + 1), guess = new Int32Array(Q + 1);
+    for (let j = 0; j <= H; j++) bound[j] = Math.cos(j * Math.PI / H);
+    for (let q = 0; q <= Q; q++) guess[q] = Math.min(H - 1, Math.floor(H * (0.5 - Math.asin(Math.min(1, q / Q * 2 - 1)) / Math.PI)));
+    return { H, Q2: Q / 2, bound, guess };
+  }
+  function latRow(z, tb) {
+    const b = tb.bound, last = tb.H - 1;
+    let j = tb.guess[((z + 1) * tb.Q2) | 0];
+    while (j > 0 && z > b[j]) j--;
+    while (j < last && z <= b[j + 1]) j++;
+    return j;
+  }
+  const ROWS_TEX = rowTable(TEX_H), ROWS_HI = rowTable(HI.ROWS * HI.T);
+
+  // Ground footprint (km) → global lights mip level: the level whose texel covers it.
+  const LIGHT_TEXEL_KM = 2 * Math.PI * EARTH_R_KM / 2048;   // global lights level 0 (~19.5 km)
+  const lightLevel = (fpKm) => {
+    const q = fpKm / LIGHT_TEXEL_KM;   // = min(3, max(0, ceil(log2(q))))
+    return q <= 1 ? 0 : q <= 2 ? 1 : q <= 4 ? 2 : 3;
+  };
+
+  // Pixels of the globe / flat disc for one (size, radius, centre): output index, disc
+  // coordinates Xs, Ys, Z = √(1 − Xs² − Ys²), and the lights mip level, which depends only on
+  // the place on the disc (footprint stretched toward the limb).
+  const discs = new Map();   // key → disc (one per view kind and resolution in use)
+  function discPixels(flat, s, r, cx, cy) {
+    const key = `${flat ? 'f' : 'g'}|${s}|${r}|${cx}|${cy}`;
+    let disc = discs.get(key);
+    if (disc) return disc;
+    if (discs.size > 5) discs.clear();
     const x0 = Math.max(0, Math.floor(cx - r)), x1 = Math.min(s, Math.ceil(cx + r));
     const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(s, Math.ceil(cy + r));
+    const list = [];
     for (let py = y0; py < y1; py++) {
       const Ys = (cy - py - 0.5) / r;
       for (let pxl = x0; pxl < x1; pxl++) {
         const Xs = (pxl + 0.5 - cx) / r;
-        const d = Xs * Xs + Ys * Ys;
-        if (d > 1) continue;
-        let lon, lat, ex, ey, ez;   // geographic position and Earth-fixed unit normal
-        let fpKm = 0;               // ground footprint of this pixel (km), for the lights LOD
-        let hitT = 0;               // pilot: distance from the camera to the ground point (km)
-        if (cam) {
-          const { c, f, u, rt } = cam;
-          let dx = f[0] + (Xs * rt[0] + Ys * u[0]) * tanH;
-          let dy = f[1] + (Xs * rt[1] + Ys * u[1]) * tanH;
-          let dz = f[2] + (Xs * rt[2] + Ys * u[2]) * tanH;
-          const dn = Math.hypot(dx, dy, dz); dx /= dn; dy /= dn; dz /= dn;
-          const b = c[0] * dx + c[1] * dy + c[2] * dz;
-          const disc = b * b - (cc2 - RE * RE);
-          const t = disc >= 0 ? -b - Math.sqrt(disc) : -1;
-          if (t <= 0) {
-            // Sky: black space with a thin atmosphere glow along the limb, lit on the day side.
-            const tc = Math.max(0, -b);                     // closest approach along the ray
-            const qx = c[0] + tc * dx, qy = c[1] + tc * dy, qz = c[2] + tc * dz;
-            const qn = Math.hypot(qx, qy, qz);
-            const glow = Math.exp(-Math.max(0, qn - RE) / 90);
-            const sd = ((qx * cgm + qy * sgm) * sx + (-qx * sgm + qy * cgm) * sy + qz * sz) / qn;
-            const lit = smoothstep(-0.2, 0.15, sd);
-            const oi = (py * s + pxl) * 4;
-            o[oi] = 4 + 90 * glow * lit; o[oi + 1] = 6 + 150 * glow * lit; o[oi + 2] = 14 + 255 * glow * (0.15 + 0.85 * lit);
-            o[oi + 3] = 255;
-            continue;
-          }
-          hitT = t;
-          const nx = (c[0] + t * dx) / RE, ny = (c[1] + t * dy) / RE, nz = (c[2] + t * dz) / RE;
-          const cosi = -(nx * dx + ny * dy + nz * dz);   // incidence of the view ray on the ground
-          fpKm = t * pixAng / (cosi > 0.15 ? cosi : 0.15);
-          ex = nx * cgm + ny * sgm; ey = -nx * sgm + ny * cgm; ez = nz;   // ECI → Earth-fixed
-          lon = Math.atan2(ey, ex);
-          lat = Math.asin(Math.max(-1, Math.min(1, ez)));
-        } else if (flat) {
-          // Azimuthal equidistant around the north pole: radius ∝ polar distance,
-          // Greenwich pointing down, longitude increasing counter-clockwise.
-          lat = Math.PI / 2 - Math.sqrt(d) * Math.PI;
-          lon = Math.atan2(Xs, -Ys) - lam;
-          fpKm = kmPerPxFlat;
-          const cl = Math.cos(lat);
-          ex = cl * Math.cos(lon); ey = cl * Math.sin(lon); ez = Math.sin(lat);
-        } else {
-          const Z = Math.sqrt(1 - d);
-          fpKm = kmPerPxGlobe / (Z > 0.15 ? Z : 0.15);   // stretched toward the limb
-          // Undo d3's [λ, φ, γ] rotation: spin back by γ, tilt back by φ, shift longitude by λ.
-          const X = Xs * cg + Ys * sg2;
-          const Y = Ys * cg - Xs * sg2;
-          const xr = Z * cp + Y * sp;
-          const zr = Y * cp - Z * sp;
-          lon = Math.atan2(X, xr) - lam;
-          lat = Math.asin(Math.max(-1, Math.min(1, zr)));
-          // Surface normal in Earth-fixed axes = (xr, X, zr) turned back by λ; no extra trig.
-          ex = xr * cl0 + X * sl0; ey = X * cl0 - xr * sl0; ez = zr;
-        }
-        const fu = ((lon / (2 * Math.PI) + 0.5) % 1 + 1) % 1, fv = Math.min(0.9999, 0.5 - lat / Math.PI);
-        const oi = (py * s + pxl) * 4;
-
-        let R = sr, G = sg, B = sb;
-        let coast = false, hiDone = false, hiIdx = -1, key = -1;
-        if (cam && hitT < hiMaxT) {
-          // High-res tile lookup; consecutive pixels mostly hit the same tile.
-          const X = fu * HI.COLS * HI.T, Y = fv * HI.ROWS * HI.T;
-          const col = (X / HI.T) | 0, row = (Y / HI.T) | 0;
-          key = row * HI.COLS + col;
-          hiIdx = ((Y | 0) - row * HI.T) * HI.T + ((X | 0) - col * HI.T);   // texel inside the tile
-          if (key !== hiKey) {
-            hiKey = key; hiTile = hiTiles.get(key) || null;
-            if (hiTile) hiTile.used = hiFrame; else requestHiTile(key);
-          }
-          if (hiTile) {
-            // Land/sea and coastline from the vector mask tile; colour (and lakes) from the raster.
-            const tx = (X | 0) - col * HI.T, ty = (Y | 0) - row * HI.T, t = hiTile.px, m = hiTile.mask;
-            const mi = ty * HI.T + tx, land = m[mi], ti = mi * 4;
-            if (land && t[ti + 3] !== 0) { R = t[ti]; G = t[ti + 1]; B = t[ti + 2]; }
-            coast = (tx + 1 < HI.T && m[mi + 1] !== land) || (ty + 1 < HI.T && m[mi + HI.T] !== land);
-            hiDone = true;
-          }
-        }
-        if (!hiDone && mask) {
-          const mu = Math.floor(fu * MASK_W), mv = Math.floor(fv * MASK_H), mi = mv * MASK_W + mu;
-          const land = mask[mi];
-          coast = land !== mask[mv * MASK_W + ((mu + 1) % MASK_W)] || (mv + 1 < MASK_H && land !== mask[mi + MASK_W]);
-          if (land) {
-            if (tex) {
-              const ti = (Math.floor(fv * tex.h) * tex.w + Math.floor(fu * tex.w)) * 4, t = tex.px;
-              if (t[ti + 3] !== 0) { R = t[ti]; G = t[ti + 1]; B = t[ti + 2]; }   // else: lake
-            } else { R = lr; G = lg; B = lb; }
-          }
-        }
-        if (coast) { R = R * 0.45 + kr * 0.55; G = G * 0.45 + kg * 0.55; B = B * 0.45 + kb * 0.55; }
-
-        if (withNight) {
-          // Sun elevation → night factor, with a soft twilight band (~+6° … −7°).
-          const sunDot = ex * sx + ey * sy + ez * sz;
-          const n = smoothstep(0.1, -0.12, sunDot);
-          if (n > 0) {
-            const a = 0.78 * n;
-            R = R * (1 - a) + 4 * a; G = G * (1 - a) + 8 * a; B = B * (1 - a) + 28 * a;
-            if (lights) {
-              // Level of detail by footprint: high-res tile (pilot, ≤ 5 km), its half-res mip
-              // (≤ 10 km), else the global mip whose texel covers the footprint.
-              let L = -1;
-              if (key >= 0 && fpKm < 10) {
-                if (key !== litKey) {
-                  litKey = key; litTile = litTiles.get(key) || null;
-                  if (litTile) litTile.used = hiFrame; else requestLitTile(key);
-                }
-                if (litTile) {
-                  if (fpKm < 5) L = litTile.px[hiIdx];
-                  else { const ty = (hiIdx / HI.T) | 0, tx = hiIdx - ty * HI.T; L = litTile.px1[(ty >> 1) * (HI.T >> 1) + (tx >> 1)]; }
-                }
-              }
-              if (L < 0) {
-                const lv = mips ? Math.min(mips.length - 1, Math.max(0, Math.ceil(Math.log2(fpKm / LIGHT_TEXEL_KM)))) : 0;
-                const m = mips ? mips[lv] : lights;
-                L = m.px[Math.floor(fv * m.h) * m.w + Math.floor(fu * m.w)];
-              }
-              L *= n;
-              R += L; G += L * 0.8; B += L * 0.45;
-            }
-          }
-        }
-        if (cam) {
-          if (grat) {
-            // Graticule every 10°, line width ≈ one pixel's footprint on the ground.
-            const fp = hitT * pixAng / RE * DEG * 0.8;
-            const la = lat * DEG, lo = lon * DEG;
-            const dLat = Math.abs(la - Math.round(la / 10) * 10);
-            const dLon = Math.abs(lo - Math.round(lo / 10) * 10) * Math.cos(lat);
-            if (dLat < fp || dLon < fp) { R = R * 0.8 + 51; G = G * 0.8 + 51; B = B * 0.8 + 51; }
-          }
-          // Aerial haze toward the horizon.
-          const sd = ex * sx + ey * sy + ez * sz, lit = smoothstep(-0.12, 0.1, sd);
-          const hz = 0.6 * Math.pow(Math.min(1, hitT / tHorizon), 5);
-          R = R * (1 - hz) + (12 + 120 * lit) * hz; G = G * (1 - hz) + (18 + 160 * lit) * hz; B = B * (1 - hz) + (40 + 210 * lit) * hz;
-        }
-        o[oi] = R; o[oi + 1] = G; o[oi + 2] = B; o[oi + 3] = 255;   // Uint8Clamped clamps
+        if (Xs * Xs + Ys * Ys <= 1) list.push(py * s + pxl);
       }
     }
-    globeBuf.getContext('2d').putImageData(globeImg, 0, 0);
-    return globeBuf;
+    const n = list.length, idx = Int32Array.from(list);
+    const Xa = new Float64Array(n), Ya = new Float64Array(n), Za = new Float64Array(n), lod = new Uint8Array(n);
+    const kmPerPxGlobe = EARTH_R_KM / r, flatLod = lightLevel(Math.PI * EARTH_R_KM / r);
+    for (let i = 0; i < n; i++) {
+      const py = Math.floor(idx[i] / s), pxl = idx[i] - py * s;
+      const Xs = (pxl + 0.5 - cx) / r, Ys = (cy - py - 0.5) / r, Z = Math.sqrt(1 - (Xs * Xs + Ys * Ys));
+      Xa[i] = Xs; Ya[i] = Ys; Za[i] = Z;
+      lod[i] = flat ? flatLod : lightLevel(kmPerPxGlobe / (Z > 0.15 ? Z : 0.15));
+    }
+    disc = { key, n, idx, Xa, Ya, Za, lod };
+    discs.set(key, disc);
+    return disc;
+  }
+
+  // Per-pixel geometry of the globe / flat view for one disc and (φ, γ); λ is applied per frame.
+  //   ub  longitude before the λ turn, in texels     row  texel row (fv · TEX_H)
+  //   nP, nQ, nZ  surface normal: Earth-fixed normal = (nP·cosλ + nQ·sinλ, nQ·cosλ − nP·sinλ, nZ)
+  // (+ idx, lod from discPixels())
+  let geo = null;
+  function viewGeometry(flat, s, r, cx, cy, phi, gam) {
+    const D = discPixels(flat, s, r, cx, cy);
+    const key = flat ? D.key : `${D.key}|${phi}|${gam}`;
+    if (geo && geo.key === key) return geo;
+    const n = D.n;
+    let g = geo;
+    if (!g || g.cap < n) {   // reused while dragging: no per-frame allocation
+      g = { cap: n, ub: new Float64Array(n), row: new Int32Array(n), nP: new Float32Array(n), nQ: new Float32Array(n), nZ: new Float32Array(n) };
+    }
+    const { ub, row, nP, nQ, nZ } = g, { Xa, Ya, Za } = D;
+    const U = TEX_W / TWO_PI;
+    if (flat) {
+      for (let i = 0; i < n; i++) {
+        // Azimuthal equidistant around the north pole: radius ∝ polar distance,
+        // Greenwich pointing down, longitude increasing counter-clockwise.
+        const Xs = Xa[i], Ys = Ya[i];
+        const lat = Math.PI / 2 - Math.sqrt(Xs * Xs + Ys * Ys) * Math.PI, lon = Math.atan2(Xs, -Ys);
+        const cl = Math.cos(lat);
+        nP[i] = cl * Math.cos(lon); nQ[i] = cl * Math.sin(lon); nZ[i] = Math.sin(lat);
+        ub[i] = lon * U;
+        row[i] = Math.floor(Math.min(0.9999, 0.5 - lat / Math.PI) * TEX_H);
+      }
+    } else {
+      const cp = Math.cos(phi), sp = Math.sin(phi), cg = Math.cos(gam), sg = Math.sin(gam);
+      for (let i = 0; i < n; i++) {
+        // Undo d3's [λ, φ, γ] rotation: spin back by γ, tilt back by φ (λ: per frame).
+        const Xs = Xa[i], Ys = Ya[i], Z = Za[i];
+        const X = Xs * cg + Ys * sg, Y = Ys * cg - Xs * sg;
+        const xr = Z * cp + Y * sp, zr = Y * cp - Z * sp;
+        nP[i] = xr; nQ[i] = X; nZ[i] = zr;
+        ub[i] = fastAtan2(X, xr) * U;
+        row[i] = latRow(zr > 1 ? 1 : zr < -1 ? -1 : zr, ROWS_TEX);
+      }
+    }
+    g.n = n; g.idx = D.idx; g.lod = D.lod; g.key = key;
+    geo = g;
+    return g;
+  }
+
+  // Pilot view: unit ray of each screen pixel in camera axes (right, up, forward).
+  const raysBySize = new Map();
+  function pilotRays(s) {
+    let rays = raysBySize.get(s);
+    if (rays) return rays;
+    if (raysBySize.size > 3) raysBySize.clear();
+    const c = s / 2, tanH = Math.tan(PILOT_HALF_FOV), list = [];
+    for (let py = 0; py < s; py++) {
+      const Ys = (c - py - 0.5) / c;
+      for (let pxl = 0; pxl < s; pxl++) {
+        const Xs = (pxl + 0.5 - c) / c;
+        if (Xs * Xs + Ys * Ys <= 1) list.push(py * s + pxl);
+      }
+    }
+    const n = list.length, idx = Int32Array.from(list);
+    const ra = new Float32Array(n), ru = new Float32Array(n), rf = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const py = Math.floor(idx[i] / s), pxl = idx[i] - py * s;
+      const a = (pxl + 0.5 - c) / c * tanH, b = (c - py - 0.5) / c * tanH, k = 1 / Math.sqrt(1 + a * a + b * b);
+      ra[i] = a * k; ru[i] = b * k; rf[i] = k;
+    }
+    rays = { s, n, idx, ra, ru, rf };
+    raysBySize.set(s, rays);
+    return rays;
+  }
+
+  // Renders into a buffer of scale × the display size (scale < 1 only while the view moves on a
+  // machine too slow for full resolution, see pixelScale()); returns the buffer canvas.
+  const globeBufs = new Map();   // buffer size → {canvas, ctx, img, u32, footprint}
+  function renderGlobePixels(withNight, scale = 1) {
+    const s = Math.round(state.size * scale), k = s / state.size, flat = isFlat(), cam = isPilot() ? state.cam : null;
+    const r = (cam ? state.size / 2 : discRadius()) * k;   // pilot view fills the whole round screen
+    const cx = projection.translate()[0] * k, cy = projection.translate()[1] * k;
+    let buf = globeBufs.get(s);
+    if (!buf) {
+      if (globeBufs.size > 3) globeBufs.clear();   // display size changed
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = s;
+      const bctx = canvas.getContext('2d'), img = bctx.createImageData(s, s);
+      buf = { canvas, ctx: bctx, img, u32: new Uint32Array(img.data.buffer), footprint: '' };
+      globeBufs.set(s, buf);
+    }
+    // Pixels outside the disc stay transparent; clear only when the disc changes.
+    const footprint = `${r}|${cx}|${cy}`;
+    if (footprint !== buf.footprint) { buf.u32.fill(0); buf.footprint = footprint; }
+    const out = buf.u32, surf = surfaceColors();
+    const lights = withNight ? state.lights : null;
+    const mips = lights && lights.w === TEX_W && lights.h === TEX_H ? state.lightMips : null;   // texel grid shared with surf
+    // Sun direction in Earth-fixed coordinates.
+    const [slon, slat] = subsolarPoint(simTime()).map((d) => d / DEG);
+    const sx = Math.cos(slat) * Math.cos(slon), sy = Math.cos(slat) * Math.sin(slon), sz = Math.sin(slat);
+    if (cam) renderPilotPixels(out, surf, withNight, mips, s, cam, sx, sy, sz);
+    else {
+      const lam = state.rotate[0] / DEG, phi = state.rotate[1] / DEG, gam = (state.rotate[2] || 0) / DEG;
+      const g = viewGeometry(flat, s, r, cx, cy, flat ? 0 : phi, flat ? 0 : gam);
+      const cl0 = Math.cos(lam), sl0 = Math.sin(lam);
+      const sunP = sx * cl0 - sy * sl0, sunQ = sx * sl0 + sy * cl0;   // sun · normal = nP·sunP + nQ·sunQ + nZ·sz
+      // Column = (ub − λ·TEX_W/2π + TEX_W/2) mod TEX_W; + TEX_W keeps it positive for the mask.
+      const lamU = TEX_W / 2 + TEX_W - lam * TEX_W / TWO_PI;
+      const { n, idx, ub, row, lod, nP, nQ, nZ } = g;
+      const m0 = mips && mips[0].px, m1 = mips && mips[1].px, m2 = mips && mips[2].px, m3 = mips && mips[3].px;
+      for (let i = 0; i < n; i++) {
+        const col = ((ub[i] + lamU) | 0) & (TEX_W - 1), rw = row[i];
+        let c = surf[rw * TEX_W + col];
+        if (withNight) {
+          // Sun elevation → night factor, with a soft twilight band (~+6° … −7°).
+          const sunDot = nP[i] * sunP + nQ[i] * sunQ + nZ[i] * sz;
+          if (sunDot < 0.1) {
+            let t = (sunDot - 0.1) / -0.22; if (t > 1) t = 1;
+            const nf = t * t * (3 - 2 * t), a = 0.78 * nf, ia = 1 - a;
+            let R = (c & 255) * ia + 4 * a, G = ((c >> 8) & 255) * ia + 8 * a, B = ((c >> 16) & 255) * ia + 28 * a;
+            if (m0) {
+              const lv = lod[i];
+              let L = lv === 0 ? m0[rw * TEX_W + col]
+                : lv === 1 ? m1[(rw >> 1) * (TEX_W >> 1) + (col >> 1)]
+                  : lv === 2 ? m2[(rw >> 2) * (TEX_W >> 2) + (col >> 2)]
+                    : m3[(rw >> 3) * (TEX_W >> 3) + (col >> 3)];
+              L *= nf;
+              R += L; G += L * 0.8; B += L * 0.45;
+            }
+            c = packRgb(R, G, B);
+          }
+        }
+        out[idx[i]] = c;
+      }
+    }
+    buf.ctx.putImageData(buf.img, 0, 0);
+    return buf.canvas;
+  }
+
+  // Pilot camera: ray = rt·a + u·b + f·c per pixel (pilotRays); Earth is a sphere of radius
+  // EARTH_R_KM. Sky: black space with a thin atmosphere glow along the limb, lit on the day
+  // side. Ground: high-res tiles near the camera, the global texture further out, aerial haze
+  // toward the horizon, graticule every 10°.
+  const GLOW_KM = 2500, GLOW = Float64Array.from({ length: GLOW_KM + 1 }, (_, h) => Math.exp(-h / 90));
+  function renderPilotPixels(out, surf, withNight, mips, s, cam, sx, sy, sz) {
+    const { n, idx, ra, ru, rf } = pilotRays(s);
+    const tanH = Math.tan(PILOT_HALF_FOV), pixAng = 2 * tanH / s;
+    const gm = cam.gmst, cgm = Math.cos(gm), sgm = Math.sin(gm);
+    const RE = EARTH_R_KM, [c0, c1, c2] = cam.c, cc2 = c0 * c0 + c1 * c1 + c2 * c2, cc2R = cc2 - RE * RE;
+    const [f0, f1, f2] = cam.f, [u0, u1, u2] = cam.u, [r0, r1, r2] = cam.rt;
+    const tHorizon = Math.sqrt(Math.max(0, cc2R));
+    const grat = ui.graticule.checked;
+    const hiMaxT = HI.FOOTPRINT_KM / pixAng;   // use tiles while hitT < this
+    const T = HI.T, HW = HI.COLS * T, HH = HI.ROWS * T;
+    let hiKey = -1, hiTile = null, litKey = -1, litTile = null;
+    hiFrame++;
+    // Sun in the camera's (ECI) frame, for the sky glow.
+    const ssx = sx * cgm - sy * sgm, ssy = sx * sgm + sy * cgm;
+    const m0 = mips && mips[0].px, m1 = mips && mips[1].px, m2 = mips && mips[2].px, m3 = mips && mips[3].px;
+    const iRE = 1 / RE;
+    for (let i = 0; i < n; i++) {
+      const a = ra[i], b = ru[i], cf = rf[i];
+      const dx = r0 * a + u0 * b + f0 * cf, dy = r1 * a + u1 * b + f1 * cf, dz = r2 * a + u2 * b + f2 * cf;
+      const bb = c0 * dx + c1 * dy + c2 * dz;
+      const disc = bb * bb - cc2R;
+      const t = disc >= 0 ? -bb - Math.sqrt(disc) : -1;
+      if (t <= 0) {
+        const tc = bb < 0 ? -bb : 0;                     // closest approach along the ray
+        const qx = c0 + tc * dx, qy = c1 + tc * dy, qz = c2 + tc * dz;
+        const qn = Math.sqrt(qx * qx + qy * qy + qz * qz);
+        // glow = exp(−height / 90 km), linearly interpolated from a 1 km table.
+        const hq = qn > RE ? qn - RE : 0, hi = hq | 0;
+        const glow = hi < GLOW_KM ? GLOW[hi] + (GLOW[hi + 1] - GLOW[hi]) * (hq - hi) : 0;
+        const sd = (qx * ssx + qy * ssy + qz * sz) / qn;
+        let lt = (sd + 0.2) / 0.35; lt = lt < 0 ? 0 : lt > 1 ? 1 : lt;
+        const lit = lt * lt * (3 - 2 * lt);
+        out[idx[i]] = packRgb(4 + 90 * glow * lit, 6 + 150 * glow * lit, 14 + 255 * glow * (0.15 + 0.85 * lit));
+        continue;
+      }
+      const nx = (c0 + t * dx) * iRE, ny = (c1 + t * dy) * iRE, nz = (c2 + t * dz) * iRE;
+      const ex = nx * cgm + ny * sgm, ey = -nx * sgm + ny * cgm, ez = nz;   // ECI → Earth-fixed
+      const ezc = ez > 1 ? 1 : ez < -1 ? -1 : ez;
+      const lon = fastAtan2(ey, ex);
+      let fu = lon / TWO_PI + 0.5; if (fu >= 1) fu -= 1;
+
+      let c = -1, hiIdx = -1, key = -1, grow = -1, gcol = 0;   // grow / gcol: global texel, when needed
+      if (t < hiMaxT) {
+        // High-res tile lookup; consecutive pixels mostly hit the same tile.
+        const X = fu * HW, Yi = latRow(ezc, ROWS_HI);
+        const col = (X / T) | 0, row = (Yi / T) | 0;
+        key = row * HI.COLS + col;
+        hiIdx = (Yi - row * T) * T + ((X | 0) - col * T);   // texel inside the tile
+        if (key !== hiKey) {
+          hiKey = key; hiTile = hiTiles.get(key) || null;
+          if (hiTile) hiTile.used = hiFrame; else requestHiTile(key);
+        }
+        if (hiTile) c = hiTile.col[hiIdx];
+      }
+      if (c === -1) { gcol = Math.floor(fu * TEX_W); grow = latRow(ezc, ROWS_TEX); c = surf[grow * TEX_W + gcol]; }
+      let R = c & 255, G = (c >> 8) & 255, B = (c >> 16) & 255;
+      const sunDot = ex * sx + ey * sy + ez * sz;
+      if (withNight && sunDot < 0.1) {
+        let tt = (sunDot - 0.1) / -0.22; if (tt > 1) tt = 1;
+        const nf = tt * tt * (3 - 2 * tt), aa = 0.78 * nf, ia = 1 - aa;
+        R = R * ia + 4 * aa; G = G * ia + 8 * aa; B = B * ia + 28 * aa;
+        if (m0) {
+          // Level of detail by the pixel's ground footprint: high-res tile (≤ 5 km), its
+          // half-res mip (≤ 10 km), else the global mip whose texel covers the footprint.
+          const cosi = -(nx * dx + ny * dy + nz * dz);   // incidence of the view ray on the ground
+          const fpKm = t * pixAng / (cosi > 0.15 ? cosi : 0.15);
+          let L = -1;
+          if (key >= 0 && fpKm < 10) {
+            if (key !== litKey) {
+              litKey = key; litTile = litTiles.get(key) || null;
+              if (litTile) litTile.used = hiFrame; else requestLitTile(key);
+            }
+            if (litTile) {
+              if (fpKm < 5) L = litTile.px[hiIdx];
+              else { const ty = (hiIdx / T) | 0, tx = hiIdx - ty * T; L = litTile.px1[(ty >> 1) * (T >> 1) + (tx >> 1)]; }
+            }
+          }
+          if (L < 0) {
+            if (grow < 0) { gcol = Math.floor(fu * TEX_W); grow = latRow(ezc, ROWS_TEX); }
+            const lv = lightLevel(fpKm);
+            L = lv === 0 ? m0[grow * TEX_W + gcol]
+              : lv === 1 ? m1[(grow >> 1) * (TEX_W >> 1) + (gcol >> 1)]
+                : lv === 2 ? m2[(grow >> 2) * (TEX_W >> 2) + (gcol >> 2)]
+                  : m3[(grow >> 3) * (TEX_W >> 3) + (gcol >> 3)];
+          }
+          L *= nf;
+          R += L; G += L * 0.8; B += L * 0.45;
+        }
+      }
+      if (grat) {
+        // Graticule every 10°, line width ≈ one pixel's footprint on the ground.
+        const fp = t * pixAng / RE * DEG * 0.8, cosLat = Math.sqrt(1 - ezc * ezc);
+        const la = fastAtan2(ezc, cosLat) * DEG, lo = lon * DEG;
+        const dLat = Math.abs(la - Math.round(la / 10) * 10);
+        const dLon = Math.abs(lo - Math.round(lo / 10) * 10) * cosLat;
+        if (dLat < fp || dLon < fp) { R = R * 0.8 + 51; G = G * 0.8 + 51; B = B * 0.8 + 51; }
+      }
+      // Aerial haze toward the horizon.
+      let lt = (sunDot + 0.12) / 0.22; lt = lt < 0 ? 0 : lt > 1 ? 1 : lt;
+      const lit = lt * lt * (3 - 2 * lt);
+      const h1 = t < tHorizon ? t / tHorizon : 1, hz = 0.6 * h1 * h1 * h1 * h1 * h1, ih = 1 - hz;
+      R = R * ih + (12 + 120 * lit) * hz; G = G * ih + (18 + 160 * lit) * hz; B = B * ih + (40 + 210 * lit) * hz;
+      out[idx[i]] = packRgb(R, G, B);
+    }
   }
 
   // Element sources, first that answers wins: the local dev server's CelesTrak proxy; on the
@@ -704,13 +971,16 @@
       const [cx, cy] = projection.translate();
       return { x, y, hidden: false, front: true, inView: true, v: [x - cx, cy - y, 0] };
     }
-    const [l, p] = d3.geoRotation(projection.rotate())([lon, lat]).map((d) => d / DEG);
+    // Rotated unit vector: ex = screen right, ey = screen up, ez = toward the viewer.
+    const M = rotationMatrix(projection.rotate());
+    const la = lat / DEG, lo = lon / DEG, cla = Math.cos(la);
+    const ux = cla * Math.cos(lo), uy = cla * Math.sin(lo), uz = Math.sin(la);
     const r = projection.scale();
     const k = r * (1 + (Number(ui.exag.value) * altKm) / EARTH_R_KM);
     const [cx, cy] = projection.translate();
-    const ex = Math.cos(p) * Math.sin(l);
-    const ey = Math.sin(p);
-    const ez = Math.cos(p) * Math.cos(l);
+    const ex = M[3] * ux + M[4] * uy + M[5] * uz;
+    const ey = M[6] * ux + M[7] * uy + M[8] * uz;
+    const ez = M[0] * ux + M[1] * uy + M[2] * uz;
     const x = cx + k * ex;
     const y = cy - k * ey;
     const hidden = ez < 0 && k * Math.hypot(ex, ey) < r;
@@ -769,21 +1039,9 @@
     // Sea, terrain, coastline, night side and city lights: one per-pixel pass.
     ctx.save();
     ctx.beginPath(); path(sphere); ctx.clip();
-    const tp = performance.now();
-    ctx.drawImage(renderGlobePixels(ui.night.checked), 0, 0);
-    perf.pixels = performance.now() - tp;
+    drawGlobePixels();
 
-    if (ui.borders.checked && state.borders) {
-      ctx.beginPath(); path(state.borders);
-      ctx.setLineDash([3, 2]);
-      ctx.strokeStyle = C.border; ctx.lineWidth = 0.7; ctx.stroke();
-      ctx.setLineDash([]);
-    }
-
-    if (ui.graticule.checked) {
-      ctx.beginPath(); path(graticule);
-      ctx.strokeStyle = C.graticule; ctx.lineWidth = 0.6; ctx.stroke();
-    }
+    drawMapLines();
 
     drawFootprint();
     drawBehindEarth();
@@ -800,6 +1058,75 @@
     if (state.menuOpen) drawMenu();
   }
 
+  // Borders and graticule. Globe: stroked straight onto the display (cheap, globeLinePath()).
+  // Flat map: d3's azimuthal path is costly and the map only turns while dragged, so the lines
+  // live in a layer that is redrawn only when the turn, the size or the toggles change.
+  function strokeMapLines(g, lp) {
+    if (ui.borders.checked && state.borders) {
+      g.beginPath(); lp(state.borders);
+      g.setLineDash([3, 2]);
+      g.strokeStyle = C.border; g.lineWidth = 0.7; g.stroke();
+      g.setLineDash([]);
+    }
+    if (ui.graticule.checked) {
+      g.beginPath(); lp(graticule);
+      g.strokeStyle = C.graticule; g.lineWidth = 0.6; g.stroke();
+    }
+  }
+  let flatLines = null;
+  function drawMapLines() {
+    if (!isFlat()) { strokeMapLines(ctx, linePath); return; }
+    const s = state.size;
+    const key = `${s}|${state.rotate.join()}|${ui.borders.checked}|${ui.graticule.checked}|${!!state.borders}`;
+    if (!flatLines || flatLines.key !== key) {
+      let c = flatLines && flatLines.c;
+      if (!c || c.width !== s) { c = document.createElement('canvas'); c.width = c.height = s; }
+      const g = c.getContext('2d');
+      g.clearRect(0, 0, s, s);
+      strokeMapLines(g, d3.geoPath(projection, g));
+      flatLines = { key, c };
+    }
+    ctx.drawImage(flatLines.c, 0, 0);
+  }
+
+  // Per-pixel layer onto the display, at the resolution pixelScale() picked for this frame.
+  function drawGlobePixels() {
+    const t0 = performance.now(), s = state.size, scale = frameScale;
+    const buf = renderGlobePixels(ui.night.checked, scale);
+    if (buf.width === s) ctx.drawImage(buf, 0, 0);
+    else ctx.drawImage(buf, 0, 0, buf.width, buf.width, 0, 0, s, s);   // smooth upscale
+    perf.pixels = performance.now() - t0;
+    perf.scale = scale;
+    // Cost per buffer pixel while the view moves, per kind of view (smoothed). The first frame
+    // after a change of resolution also rebuilds its caches, so it is left out.
+    if (frameMoving && buf.width === lastBufWidth) {
+      const kind = viewKind(state.mode), ms = perf.pixels / (buf.width * buf.width);
+      quality[kind] = quality[kind] ? quality[kind] * 0.7 + ms * 0.3 : ms;
+    }
+    lastBufWidth = buf.width;
+  }
+
+  // Adaptive resolution of the per-pixel layer. While the view moves (drag, inertia, glide
+  // back, Earth spin) a frame whose pixel pass would take longer than PIXEL_BUDGET_MS renders
+  // the layer at 3/4 or 1/2 resolution and scales it up smoothly; once the view rests, it is
+  // drawn at full resolution again. A fast machine always stays at full resolution; ?fullres
+  // in the URL turns the adaptation off.
+  const PIXEL_BUDGET_MS = 11, ADAPTIVE = !/[?&]fullres\b/.test(location.search);
+  const quality = {};          // view kind → smoothed time per buffer pixel while moving (ms)
+  let frameScale = 1, frameMoving = false, lastBufWidth = 0;
+  function pixelScale(moving) {
+    if (!moving || !ADAPTIVE) return 1;
+    const perPx = quality[viewKind(state.mode)];
+    if (!perPx) return frameScale;
+    const full = perPx * state.size * state.size;
+    // Step down at once when over budget; step up only with some headroom (no flicker).
+    for (const sc of [1, 0.75, 0.5]) {
+      const est = full * sc * sc;
+      if (est <= PIXEL_BUDGET_MS * (sc > frameScale ? 0.85 : 1)) return sc;
+    }
+    return 0.5;
+  }
+
   // Pilot view: what you'd see from the object looking prograde. Ray-cast Earth below the
   // horizon, space and limb glow above; whole round screen, no globe frame.
   function drawPilot() {
@@ -810,11 +1137,7 @@
     ctx.fillRect(0, 0, s, s);
     ctx.save();
     ctx.beginPath(); ctx.arc(c, c, c, 0, 2 * Math.PI); ctx.clip();
-    if (state.cam) {
-      const tp = performance.now();
-      ctx.drawImage(renderGlobePixels(ui.night.checked), 0, 0);
-      perf.pixels = performance.now() - tp;
-    }
+    if (state.cam) drawGlobePixels();
     const rim = ctx.createRadialGradient(c, c, c * 0.75, c, c, c);
     rim.addColorStop(0, 'rgba(0,0,0,0)');
     rim.addColorStop(1, 'rgba(0,0,0,.45)');
@@ -1854,13 +2177,15 @@
     const now = performance.now(), dt = Math.min(0.5, (now - (lastEase || now)) / 1000);
     lastEase = now;
     const t = targetRotation();
-    if (!t) return;
+    if (!t) return false;
     const wrap = (d) => ((d + 540) % 360) - 180;
     const d = [wrap(t[0] - state.rotate[0]), t[1] - state.rotate[1], wrap(t[2] - (state.rotate[2] || 0))];
-    if (d.every((v) => Math.abs(v) < 0.005)) { state.rotate = t; return; }
-    const k = d.every((v) => Math.abs(v) < 0.5) ? 1 : 1 - Math.exp(-dt / GLIDE_TAU_S);   // glide in, then lock on
+    if (d.every((v) => Math.abs(v) < 0.005)) { state.rotate = t; return false; }
+    const lock = d.every((v) => Math.abs(v) < 0.5);
+    const k = lock ? 1 : 1 - Math.exp(-dt / GLIDE_TAU_S);   // glide in, then lock on
     state.rotate = [wrap(state.rotate[0] + d[0] * k), state.rotate[1] + d[1] * k, wrap((state.rotate[2] || 0) + d[2] * k)];
     state.dirty = true;
+    return !lock;   // true while gliding (the view is moving)
   }
 
   function setMode(mode) {
@@ -1988,14 +2313,43 @@
       rotateBy(state.vel[0], state.vel[1]);
       state.vel = state.vel.map((v) => v * 0.92);
     }
-    if (!drag && ts > state.manualUntil) easeToTarget();
+    const inertia = !drag && (Math.abs(state.vel[0]) > 0.01 || Math.abs(state.vel[1]) > 0.01);
+    const glide = !drag && ts > state.manualUntil && easeToTarget();
+    const moving = !!(drag && drag.moved) || inertia || glide || state.mode === 'spin';
+    if (!moving && frameScale !== 1) state.dirty = true;   // sharpen the last reduced frame
     if (state.dirty) {
       state.dirty = false;
+      frameMoving = moving;
+      frameScale = pixelScale(moving);
       const t0 = performance.now();
       draw();
       perf.total = performance.now() - t0;
+      if (fps) fps.drawn(perf.total);
     }
+    if (fps) fps.tick(ts);
   }
+
+  // Optional frame-time overlay: open the page with ?fps.
+  const fps = /[?&]fps\b/.test(location.search) ? (() => {
+    const box = document.createElement('div');
+    box.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:10;padding:4px 6px;border-radius:4px;'
+      + 'background:rgba(0,0,0,.7);color:#8f8;font:11px/1.35 ui-monospace,monospace;white-space:pre;pointer-events:none';
+    document.body.appendChild(box);
+    let t0 = 0, frames = 0, draws = 0, sum = 0, max = 0, gap = 0, last = 0;
+    return {
+      drawn(ms) { draws++; sum += ms; max = Math.max(max, ms); },
+      tick(ts) {
+        frames++;
+        if (last) gap = Math.max(gap, ts - last);
+        last = ts;
+        if (ts - t0 < 1000) return;
+        box.textContent = `${(frames * 1000 / (ts - t0)).toFixed(0)} fps  longest gap ${gap.toFixed(0)} ms\n`
+          + `draw ${draws ? (sum / draws).toFixed(1) : '-'} ms avg, ${max.toFixed(1)} max\n`
+          + `pixels ${(perf.pixels || 0).toFixed(1)} ms @ ${Math.round((perf.scale || 1) * 100)}%`;
+        t0 = ts; frames = draws = sum = max = gap = 0;
+      },
+    };
+  })() : null;
 
   layout();
   setMode(state.mode);
