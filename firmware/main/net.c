@@ -76,7 +76,7 @@ void net_init(void)
     esp_err_t le = esp_event_loop_create_default();   // tolerate a loop created elsewhere
     if (le != ESP_OK && le != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(le);
     esp_netif_t *sta = esp_netif_create_default_wifi_sta();
-    // The only identifier the device exposes: a nondescript host name, no vendor hints.
+    // The only identifier the device exposes on the local network: its DHCP host name.
     esp_netif_set_hostname(sta, NET_HOSTNAME);
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_wifi, NULL, NULL));

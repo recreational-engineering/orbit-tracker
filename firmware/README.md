@@ -78,7 +78,7 @@ than 20 h old (its time is written to NVS before the request, so reboots and `N`
 whenever the clock is not set: CelesTrak firewalls clients that ask more often or keep asking
 after an error. The request's User-Agent names this project and its repository so CelesTrak can
 see what is asking. NTP runs on every sync. It joins as a station only (never an access point),
-presents one nondescript DHCP host name (an office-printer style name), and makes no other connection — there is no
+presents the DHCP host name `orbit-viewer`, and makes no other connection — there is no
 server, no discovery service, and no path that sends device data anywhere.
 
 Credentials and the host name live in `main/net_secret.h` (git-ignored; copy

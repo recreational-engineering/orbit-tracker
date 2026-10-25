@@ -1,8 +1,8 @@
 /* The device's only use of the network: read the current time (SNTP) and refresh the saved
  * satellite's orbital elements (one HTTPS GET to CelesTrak for the compiled-in NORAD id).
  *
- * The radio is off except during a sync. The device joins as a station only, presents a
- * nondescript host name (net_secret.h), never starts an access point, a server or any
+ * The radio is off except during a sync. The device joins as a station only, presents the
+ * host name "orbit-viewer" (net_secret.h), never starts an access point, a server or any
  * discovery service, and makes no other outbound connection. There is no code path that
  * sends device data anywhere or that lets the network command the device.
  */
